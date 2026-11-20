@@ -1,37 +1,22 @@
-"""Toggles visibility of section box in current 3D view"""
+"""Toggles visibility, active state or a temporary section box in current 3D view"""
 
-from pyrevit import framework
-from pyrevit import revit,  DB
-
-
-@revit.carryout('Toggle Section Box')
-def toggle_sectionbox():
-    # activate the show hidden so we can collect
-    # all elements (visible and hidden)
-    activeview = revit.active_view
-    activeview.EnableRevealHiddenMode()
-    view_elements = DB.FilteredElementCollector(revit.doc, activeview.Id)\
-                      .OfCategory(DB.BuiltInCategory.OST_SectionBox)\
-                      .ToElements()
-
-    # find section boxes, and try toggling their visibility
-    # usually more than one section box shows up on the list but not
-    # all of them can be toggled. Whichever that can be toggled,
-    # belongs to this view
-    for sec_box in [x for x in view_elements
-                    if x.CanBeHidden(activeview)]:
-            if sec_box.IsHidden(activeview):
-                activeview.UnhideElements(
-                    framework.List[DB.ElementId]([sec_box.Id])
-                    )
-            else:
-                activeview.HideElements(
-                    framework.List[DB.ElementId]([sec_box.Id])
-                    )
-
-    activeview.DisableTemporaryViewMode(
-        DB.TemporaryViewMode.RevealHiddenElements
-        )
+from pyrevit import revit, script
+from sbox.sbox_actions import toggle, hide, temp_switch
 
 
-toggle_sectionbox()
+DATA_SLOTNAME = "SectionBox"
+TEMP_DATAFILE = script.get_instance_data_file("SectionBoxTemp")
+PADDING = 1.0  # feet
+
+my_config = script.get_config()
+scope = my_config.get_option("scope", "Visibility")
+
+
+if scope == "Visibility":
+    hide(revit.doc)
+
+if scope == "Active State":
+    toggle(revit.doc, DATA_SLOTNAME)
+
+if scope == "Temporary Section Box":
+    temp_switch(revit.doc, TEMP_DATAFILE, padding=PADDING)

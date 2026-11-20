@@ -1,5 +1,4 @@
 import sys
-import imp
 
 from rpw.utils.logger import logger
 
@@ -54,7 +53,6 @@ class MockObject(object):
 class MockImporter(object):
     # https://github.com/gtalarico/revitpythonwrapper/issues/3
     # http://dangerontheranger.blogspot.com/2012/07/how-to-use-sysmetapath-with-python.html
-    # http://blog.dowski.com/2008/07/31/customizing-the-python-import-system/
 
     dotnet_modules = ['clr',
                       'Autodesk',
@@ -80,6 +78,7 @@ class MockImporter(object):
             return sys.modules[fullname]
         else:
             logger.debug('Importing Mock Module: {}'.format(fullname))
+            # import imp
             # mod = imp.new_module(fullname)
             # import pdb; pdb.set_trace()
             mod = MockObject(fullname=fullname)

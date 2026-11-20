@@ -74,7 +74,7 @@
 
 pyRevit helps you quickly sketch out your automation and addon ideas, in whichever language that you are most comfortable with, inside the Revit environment and using its APIs. It also ships with an extensive set of powerful tools that showcase its capabilities as a development environment. Download and install pyRevit, launch Revit, and note the new pyRevit tab that includes these tools. pyRevit also ships with a handy CLI utility for customized configuration and deployment of your tools, and a telemetry server to monitor pyRevit usage across your teams.
 
-&nbsp;
+
 
 ### pyRevit can help you
 
@@ -84,7 +84,7 @@ pyRevit helps you quickly sketch out your automation and addon ideas, in whichev
 - **Distribute your tools** (pyRevit, [Dynamo](https://dynamobim.org/), or [Grasshopper](https://www.rhino3d.com/inside)) easily to your teams using a unified interface
 - **Share your tools** with the community
 
-&nbsp;
+
 
 # Getting Started
 
@@ -153,6 +153,10 @@ Check the list of [Currently Open](https://github.com/pyrevitlabs/pyRevit/issues
 
 [Reporting New Issues](https://www.notion.so/Reporting-New-Issues-f1fdd62cf6074b318bfe8ddfbc2d8d98)
 
+**↓** If pyRevit can not be installed or uninstalled, download the standalone doctor tool and run it without installing anything (needs the .NET 8 runtime or newer)
+
+[pyrevit-doctor.exe on the releases page](https://github.com/pyrevitlabs/pyRevit/releases)
+
 &nbsp;
 
 # Getting Involved
@@ -205,8 +209,11 @@ Made with [contrib.rocks](https://contrib.rocks)
 
 ---
 
-**</>** with 🖤 in [Portland](https://en.m.wikipedia.org/wiki/Portland,_Oregon), Oregon
+Supported by devloai, autodesk ADN, greptile
+[![Greptile: The War on Bugs](https://www.greptile.com/badge.svg)](https://www.greptile.com/?utm_source=oss_badge&utm_medium=readme&utm_campaign=greptile_for_open_source)
 
-Copyright © 2014-2025 by Ehsan Iran-Nejad (pyrevitlabs.io) - All Rights Reserved
+---
+
+Copyright © 2014-2026 by Ehsan Iran-Nejad (pyrevitlabs.io) - All Rights Reserved
 
 No part of this publication may be reproduced, distributed, or transmitted in any form or by any means, including photocopying, recording, or other electronic or mechanical methods, without the prior written permission of the publisher.

@@ -1,34 +1,55 @@
 title:
-  ru: Выбрать самую верхнюю группу
-  fr_fr: Sélectionner les groupes supérieurs
-  en_us: Select topmost groups
-  de_de: Oberste übergeordnete Gruppe auswählen
+  en_us: Select topmost groups ●
+  ko: 최상위 그룹 선택 ●
+  fr_fr: Sélectionner les groupes supérieurs ●
+  ru: Выбрать самую верхнюю группу ●
+  chinese_s: 选择最高层级的组 ●
+  es_es: Seleccionar grupos superiores ●
+  de_de: Oberste übergeordnete Gruppe auswählen ●
+  pt_br: Selecionar Grupos de Nível Superior ●
 tooltip:
-  ru: >-
-    Выделяет экземпляры групп, которые содержат выделенные элементы.
-    По умолчанию исключает несгруппированные элементы из выделения.
-    
-    Shift+Click:
-    Включить несгруппированные элементы.
-  fr_fr: >-
+  en_us: |-
+    Select group instances that contain the selected elements. Ungrouped elements are excluded.
+
+    Shift-click:
+    Include ungrouped elements in the selection.
+  ko: |-
+    선택한 요소를 포함하는 그룹 인스턴스를 선택합니다. 기본적으로 그룹에 속하지 않은 요소는 제외됩니다.
+
+    Shift 키를 누르고 클릭:
+    선택 항목에 그룹에 속하지 않은 요소도 포함합니다.
+  fr_fr: |-
     Sélectionne les occurences du groupe qui contiennent les éléments sélectionnés
     Par défaut, les éléments non groupés sont exclus de la sélection
-  
-    Shift+Click:
 
+    Maj+clic :
     Inclure les éléments non-groupés
-  en_us: >-
-    Selects group instances, which contain selected elements
-    By default excludes not-grouped elements from selection
-  
-    Shift+Click:
+  ru: |-
+    Выделяет экземпляры групп, которые содержат выделенные элементы.
+    По умолчанию исключает несгруппированные элементы из выделения.
 
-    Include not-grouped elements
-  de_de: >-
+    Shift + Щелчок:
+    Включить несгруппированные элементы.
+  chinese_s: |-
+    选择包含所选图元的组实例。默认情况下，未编组的图元不会被选中。
+
+    按住 Shift 键单击：
+    同时选择未编组的图元。
+  es_es: |-
+    Selecciona instancias de grupos, que contienen elementos seleccionados
+    Por defecto excluye elementos no agrupados de la selección
+
+    Mayús-clic:
+    Incluir elementos no agrupados
+  de_de: |-
     Wählt Gruppeninstanzen aus, die die ausgewähltne Elemente enthalten
     Schließt standardmäßig nicht gruppierte Elemente von der Auswahl aus
-  
-    Shift+Click:
 
+    Bei gedrückter Umschalttaste klicken:
     Nicht gruppierte Elemente einbeziehen
-context: Selection
+  pt_br: |-
+    Seleciona instâncias de grupo que contêm elementos selecionados. por padrão, exclui elementos não agrupados da seleção
+
+    Clique mantendo a tecla Shift pressionada:
+    Incluir elementos não agrupados
+context: selection

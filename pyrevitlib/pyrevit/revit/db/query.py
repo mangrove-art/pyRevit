@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """Helper functions to query info and elements from Revit."""
+
 # pylint: disable=W0703,C0103,too-many-lines
+import numbers
 from collections import namedtuple
 from os.path import basename, splitext
 
@@ -8,10 +10,17 @@ from pyrevit import coreutils
 from pyrevit.coreutils import logger
 from pyrevit import HOST_APP, DOCS, PyRevitException
 from pyrevit import framework
-from pyrevit.compat import PY3, safe_strtype, get_elementid_value_func
+from pyrevit import automation
+from pyrevit.compat import (
+    PY3,
+    safe_strtype,
+    get_elementid_value_func,
+    get_elementid_from_value_func,
+)
 from pyrevit import DB
 from pyrevit.revit import db
 from pyrevit.revit import features
+from pyrevit.revit import geom
 
 from Autodesk.Revit.DB import Element  # pylint: disable=E0401
 
@@ -35,12 +44,16 @@ GRAPHICAL_VIEWTYPES = [
     DB.ViewType.Detail,
     DB.ViewType.CostReport,
     DB.ViewType.LoadsReport,
-    DB.ViewType.PresureLossReport,
     DB.ViewType.ColumnSchedule,
     DB.ViewType.PanelSchedule,
     DB.ViewType.Walkthrough,
     DB.ViewType.Rendering,
 ]
+# PresureLossReport typo was corrected in Revit 2027
+if HOST_APP.is_older_than(2027):
+    GRAPHICAL_VIEWTYPES.append(DB.ViewType.PresureLossReport)
+else:
+    GRAPHICAL_VIEWTYPES.append(DB.ViewType.PressureLossReport)
 
 
 DETAIL_CURVES = (DB.DetailLine, DB.DetailArc, DB.DetailEllipse, DB.DetailNurbSpline)
@@ -62,12 +75,18 @@ SheetRefInfo = namedtuple(
 ElementHistory = namedtuple("ElementHistory", ["creator", "owner", "last_changed_by"])
 
 
+@automation.operation(
+    "pyrevit.elements.name",
+    PlainEnglish="Read an element name, including a view title on a sheet when requested.",
+    effects=("model.read",),
+    inputs=("element: element", "title_on_sheet: boolean?"),
+)
 def get_name(element, title_on_sheet=False):
     """
     Retrieves the name of a Revit element, with special handling for views.
 
     Args:
-        element (DB.Element): The Revit element whose name is to be retrieved.
+        element (DB.Element | DB.Workset): The Revit element whose name is to be retrieved.
         title_on_sheet (bool, optional): If True and the element is a view,
                                          attempts to retrieve the view's title
                                          on the sheet. Defaults to False.
@@ -76,24 +95,25 @@ def get_name(element, title_on_sheet=False):
         str: The name of the element. For views, it may return the view's title
              on the sheet if `title_on_sheet` is True and the title is available.
     """
-    if isinstance(element, DB.View):
-        view_name = None
-        if title_on_sheet:
-            titleos_param = element.Parameter[DB.BuiltInParameter.VIEW_DESCRIPTION]
-            view_name = titleos_param.AsString()
+    if isinstance(element, DB.View) and title_on_sheet:
+        titleos_param = element.get_Parameter(DB.BuiltInParameter.VIEW_DESCRIPTION)
+        view_name = titleos_param.AsString()
         if view_name:
             return view_name
-        else:
-            if HOST_APP.is_newer_than("2019", or_equal=True):
-                return element.Name
-            else:
-                return element.ViewName
     if PY3:
         return element.Name
-    else:
+    try:
+        return element.Name
+    except AttributeError:
         return Element.Name.GetValue(element)
 
 
+@automation.operation(
+    "pyrevit.elements.type",
+    PlainEnglish="Get the element type for a Revit element.",
+    effects=("model.read",),
+    inputs=("element: element",),
+)
 def get_type(element):
     """Get element type.
 
@@ -107,6 +127,12 @@ def get_type(element):
     return element.Document.GetElement(type_id)
 
 
+@automation.operation(
+    "pyrevit.elements.symbol-name",
+    PlainEnglish="Read the family symbol name used by an element.",
+    effects=("model.read",),
+    inputs=("element: element",),
+)
 def get_symbol_name(element):
     """
     Retrieves the name of the symbol associated with the given Revit element.
@@ -120,6 +146,12 @@ def get_symbol_name(element):
     return get_name(element.Symbol)
 
 
+@automation.operation(
+    "pyrevit.elements.family-name",
+    PlainEnglish="Read the family name used by an element.",
+    effects=("model.read",),
+    inputs=("element: element",),
+)
 def get_family_name(element):
     """
     Retrieves the family name of a given Revit element.
@@ -168,23 +200,99 @@ def get_guid(element):
     return uid[:28] + "{0:x}".format(xor)
 
 
-def get_param(element, param_name, default=None):
+def _param_or_default(param, default):
+    """Return param if it is a live Parameter object, otherwise default."""
+    return param if param is not None else default
+
+
+def _get_param_by_element_id(element, param_id):
     """
-    Retrieves a parameter from a Revit element by its name.
+    Resolve a parameter from a DB.ElementId.
+
+    - Negative id  -> BuiltInParameter
+    - Non-negative -> shared/project parameter, preferred via GUID,
+                     fallback via Definition (non-filterable params only)
+
+    Returns DB.Parameter or None.
+    """
+    try:
+        get_elementid_value = get_elementid_value_func()
+        pid_val = get_elementid_value(param_id)
+
+        if pid_val < 0:
+            bip = DB.BuiltInParameter(pid_val)
+            return element.get_Parameter(bip)
+
+        doc = element.Document
+        param_el = doc.GetElement(param_id)
+        if param_el is None:
+            return None
+
+        if hasattr(param_el, "GuidValue") and param_el.GuidValue:
+            return element.get_Parameter(param_el.GuidValue)
+
+        if hasattr(param_el, "GetDefinition"):
+            definition = param_el.GetDefinition()
+            if definition:
+                return element.get_Parameter(definition)
+
+    except Exception:
+        pass
+
+    return None
+
+
+@automation.operation(
+    "pyrevit.parameters.resolve",
+    PlainEnglish="Find a parameter on an element by name, built-in parameter, GUID or id.",
+    effects=("model.read",),
+)
+def get_param(element, param_identifier, default=None):
+    """
+    Retrieve a single parameter from a Revit element.
+
+    Dispatch table
+    --------------
+    str                  : LookupParameter(name)
+    DB.BuiltInParameter  : get_Parameter(bip)
+    System.Guid          : get_Parameter(guid)
+    DB.ElementId         : smart lookup via _get_param_by_element_id()
 
     Args:
-        element (DB.Element): The Revit element from which to retrieve the parameter.
-        param_name (str): The name of the parameter to retrieve.
-        default: The value to return if the parameter is not found or an error occurs. Defaults to None.
+        element (DB.Element)      : The Revit element.
+        param_identifier          : str | DB.BuiltInParameter | System.Guid | DB.ElementId
+        default                   : Returned when nothing is found or on error. Default: None.
 
     Returns:
-        The parameter if found, otherwise the default value.
+        DB.Parameter or default.
+
+    Notes:
+        - String lookup is fast but ambiguous when names collide.
+        - Built-in parameter names are translated in non-English Revit builds;
+          prefer DB.BuiltInParameter over a name string for portability.
     """
-    if isinstance(element, DB.Element):
-        try:
-            return element.LookupParameter(param_name)
-        except Exception:
-            return default
+    if not isinstance(element, DB.Element):
+        return default
+
+    try:
+        if isinstance(param_identifier, str):
+            return _param_or_default(element.LookupParameter(param_identifier), default)
+
+        if isinstance(param_identifier, DB.BuiltInParameter):
+            return _param_or_default(element.get_Parameter(param_identifier), default)
+
+        if isinstance(param_identifier, framework.System.Guid):
+            return _param_or_default(element.get_Parameter(param_identifier), default)
+
+        if isinstance(param_identifier, DB.ElementId):
+            return _param_or_default(
+                _get_param_by_element_id(element, param_identifier), default
+            )
+
+    except Exception:
+        pass
+
+    return default
 
 
 def get_mark(element):
@@ -198,7 +306,7 @@ def get_mark(element):
         str: The value of the 'Mark' parameter as a string.
     Returns an empty string if the parameter is not found.
     """
-    mparam = element.Parameter[DB.BuiltInParameter.ALL_MODEL_MARK]
+    mparam = element.get_Parameter(DB.BuiltInParameter.ALL_MODEL_MARK)
     return mparam.AsString() if mparam else ""
 
 
@@ -254,7 +362,7 @@ def get_biparam_stringequals_filter(bip_paramvalue_dict):
         filters.append(bip_valuerule)
 
     if filters:
-        return DB.ElementParameterFilter(framework.List[DB.FilterRule](filters))
+        return DB.ElementParameterFilter(framework.to_clr_list(DB.FilterRule, filters))
     else:
         raise PyRevitException("Error creating filters.")
 
@@ -266,8 +374,7 @@ def get_all_elements(doc=None):
     in the provided document, including both element types and instances.
 
     Args:
-        doc (Document, optional): The Revit document to collect elements from.
-                                  If not provided, the default document (DOCS.doc) is used.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         List[Element]: A list of all elements in the document.
@@ -301,6 +408,11 @@ def get_all_elements_in_view(view):
     )
 
 
+@automation.operation(
+    "pyrevit.parameters.read",
+    PlainEnglish="Read a parameter's stored value in Revit internal units when numeric.",
+    effects=("model.read",),
+)
 def get_param_value(targetparam):
     """
     Retrieves the value of a given Revit parameter.
@@ -334,19 +446,24 @@ def get_param_value(targetparam):
     return value
 
 
-def get_value_range(param_name, doc=None):
+def get_value_range(param_name, doc=None, elements=None):
     """
-    Retrieves a set of unique values for a specified parameter from all elements in the given Revit document.
+    Retrieves a set of unique values for a specified parameter from elements in a Revit document or from a provided collection of elements.
 
     Args:
         param_name (str): The name of the parameter to retrieve values for.
-        doc (Document, optional): The Revit document to search within. If None, the current document is used.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
+        elements (iterable, optional): Specific elements to process. If provided, these elements are processed instead of calling get_all_elements(doc).
 
     Returns:
         set: A set of unique values for the specified parameter. The values can be of any type, but are typically strings.
     """
     values = set()
-    for element in get_all_elements(doc):
+    if elements is not None:
+        element_iterable = elements
+    else:
+        element_iterable = get_all_elements(doc)
+    for element in element_iterable:
         targetparam = element.LookupParameter(param_name)
         if targetparam:
             value = get_param_value(targetparam)
@@ -358,21 +475,50 @@ def get_value_range(param_name, doc=None):
     return values
 
 
-def get_elements_by_parameter(param_name, param_value, doc=None, partial=False):
+@automation.operation(
+    "pyrevit.elements.by-parameter",
+    PlainEnglish="Find elements whose named parameter matches a supplied value.",
+    effects=("model.read",),
+    inputs=("param_name: string", "param_value: scalar", "partial: boolean?"),
+)
+def get_elements_by_parameter(
+    param_name, param_value, doc=None, partial=False, view_id=None
+):
     """
-    Retrieves elements from the Revit document that match a given parameter name and value.
+    Finds elements by inspecting each element individually and comparing
+    the value of a named parameter.
+
+    This method performs a manual Python-side search and supports partial
+    string matching. It is more flexible than get_elements_by_param_value()
+    but can be significantly slower on large models because every element
+    is evaluated.
 
     Args:
         param_name (str): The name of the parameter to search for.
-        param_value (str or other): The value of the parameter to match.
-        doc (Document, optional): The Revit document to search in. If None, the current document is used.
+        param_value (object): Value to match. When partial is True, this must be a string.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
         partial (bool, optional): If True, performs a partial match on string parameter values. Defaults to False.
+        view_id (DB.ElementId, optional): Restrict the search to elements visible in the specified view. If None, searches the entire document.
 
     Returns:
         list: A list of elements that match the specified parameter name and value.
+
+    Raises:
+        PyRevitException: when partial is True and param_value is not a string.
     """
+    if partial and not isinstance(param_value, str):
+        raise PyRevitException(
+            "A partial match needs a text value, not {!r}.".format(param_value)
+        )
+    doc = doc or DOCS.doc
+    elements = (
+        DB.FilteredElementCollector(doc, view_id).ToElements()
+        if view_id
+        else get_all_elements(doc)
+    )
+
     found_els = []
-    for element in get_all_elements(doc):
+    for element in elements:
         targetparam = element.LookupParameter(param_name)
         if targetparam:
             value = get_param_value(targetparam)
@@ -388,15 +534,23 @@ def get_elements_by_parameter(param_name, param_value, doc=None, partial=False):
     return found_els
 
 
-def get_elements_by_param_value(param_name, param_value, inverse=False, doc=None):
+def get_elements_by_param_value(
+    param_name, param_value, inverse=False, doc=None, view_id=None
+):
     """
-    Retrieves elements from the Revit document based on a parameter name and value.
+    Finds elements using a native Revit ElementParameterFilter.
+
+    This method is typically much faster than get_elements_by_parameter()
+    because filtering is performed by the Revit API. It supports exact
+    string matching only and requires the parameter to be resolvable to
+    a project parameter ElementId.
 
     Args:
         param_name (str): The name of the parameter to filter by.
         param_value (str): The value of the parameter to filter by.
         inverse (bool, optional): If True, inverts the filter to exclude elements with the specified parameter value. Defaults to False.
-        doc (Document, optional): The Revit document to search in. If None, uses the default document.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
+        view_id (DB.ElementId, optional): The ID of the view to restrict the search to. Defaults to None.
 
     Returns:
         list: A list of elements that match the parameter name and value.
@@ -413,37 +567,77 @@ def get_elements_by_param_value(param_name, param_value, inverse=False, doc=None
         if inverse:
             vrule = DB.FilterInverseRule(vrule)
         param_filter = DB.ElementParameterFilter(vrule)
-        return DB.FilteredElementCollector(doc).WherePasses(param_filter).ToElements()
+        fec = (
+            DB.FilteredElementCollector(doc, view_id)
+            if view_id
+            else DB.FilteredElementCollector(doc)
+        )
+        return fec.WherePasses(param_filter).ToElements()
     else:
         return []
 
 
-def get_elements_by_categories(element_bicats, elements=None, doc=None):
+@automation.operation(
+    "pyrevit.elements.by-category",
+    PlainEnglish="Find elements in one or more Revit categories.",
+    effects=("model.read",),
+)
+def get_elements_by_categories(categories, elements=None, doc=None, view_id=None):
     """
     Retrieves elements from a Revit document based on specified categories.
 
     Args:
-        element_bicats (list): A list of built-in categories to filter elements by.
-        elements (list, optional): A list of elements to filter. If provided, the function will filter these elements.
-        doc (DB.Document, optional): The Revit document to collect elements from. If not provided, the active document is used.
+        categories (list):
+            A list of category identifiers. Supported types:
+                - DB.BuiltInCategory
+                - DB.ElementId
+                - DB.Category
+
+            The function will normalize all inputs internally.
+
+        elements (list, optional):
+            A list of elements to filter. If provided, filtering is done
+            in-memory instead of using a FilteredElementCollector.
+
+        doc (DB.Document, optional):
+            The Revit document to query. If not provided, defaults to DOCS.doc.
+
+        view_id (DB.ElementId, optional):
+            The ID of the view to restrict the search to.
 
     Returns:
-        list: A list of elements that belong to the specified categories.
+        list:
+            A list of elements that belong to the specified categories.
     """
+
+    doc = doc or DOCS.doc
+
+    def _category_to_id(cat_input, doc=None):
+        cat = get_category(cat_input, doc=doc)
+        return cat.Id if cat else None
+
+    category_ids = {_category_to_id(c, doc) for c in categories if c}
+    category_ids.discard(None)
+
     if elements:
-        return [
-            x
-            for x in elements
-            if get_builtincategory(x.Category.Name) in element_bicats
-        ]
-    cat_filters = [DB.ElementCategoryFilter(x) for x in element_bicats if x]
-    elcats_filter = DB.LogicalOrFilter(framework.List[DB.ElementFilter](cat_filters))
-    return (
-        DB.FilteredElementCollector(doc or DOCS.doc)
-        .WherePasses(elcats_filter)
-        .WhereElementIsNotElementType()
-        .ToElements()
+        return [x for x in elements if x.Category and x.Category.Id in category_ids]
+
+    cat_filters = [DB.ElementCategoryFilter(cid) for cid in category_ids]
+
+    if not cat_filters:
+        return []
+
+    elcats_filter = DB.LogicalOrFilter(
+        framework.to_clr_list(DB.ElementFilter, cat_filters)
     )
+
+    fec = (
+        DB.FilteredElementCollector(doc, view_id)
+        if view_id
+        else DB.FilteredElementCollector(doc)
+    )
+
+    return fec.WherePasses(elcats_filter).WhereElementIsNotElementType().ToElements()
 
 
 def get_elements_by_class(element_class, elements=None, doc=None, view_id=None):
@@ -461,20 +655,15 @@ def get_elements_by_class(element_class, elements=None, doc=None, view_id=None):
     """
     if elements:
         return [x for x in elements if isinstance(x, element_class)]
-    if view_id:
-        return (
-            DB.FilteredElementCollector(doc or DOCS.doc, view_id)
-            .OfClass(element_class)
-            .WhereElementIsNotElementType()
-            .ToElements()
-        )
-    else:
-        return (
-            DB.FilteredElementCollector(doc or DOCS.doc)
-            .OfClass(element_class)
-            .WhereElementIsNotElementType()
-            .ToElements()
-        )
+
+    doc = doc or DOCS.doc
+    fec = (
+        DB.FilteredElementCollector(doc, view_id)
+        if view_id
+        else DB.FilteredElementCollector(doc)
+    )
+
+    return fec.OfClass(element_class).WhereElementIsNotElementType().ToElements()
 
 
 def get_types_by_class(type_class, types=None, doc=None):
@@ -484,7 +673,7 @@ def get_types_by_class(type_class, types=None, doc=None):
     Args:
         type_class (type): The class type to filter elements by.
         types (list, optional): A list of elements to filter. If not provided, elements will be collected from the Revit document.
-        doc (Document, optional): The Revit document to collect elements from if 'types' is not provided. Defaults to the active document.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         list: A list of elements that are instances of the specified class type.
@@ -500,7 +689,7 @@ def get_family(family_name, doc=None):
 
     Args:
         family_name (str): The name of the family to search for.
-        doc (DB.Document, optional): The Revit document to search in. If not provided, the current document is used.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         list[DB.Element]: A list of family elements that match the given family name.
@@ -525,7 +714,7 @@ def get_family_symbol(family_name, symbol_name, doc=None):
     Args:
         family_name (str): The name of the family to search for.
         symbol_name (str): The name of the symbol within the family to search for.
-        doc (DB.Document, optional): The Revit document to search in. If not provided, the default document is used.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         list[DB.Element]: A list of family symbols that match the specified family name and symbol name.
@@ -551,8 +740,7 @@ def get_families(doc=None, only_editable=True):
     Retrieves a list of families from the given Revit document.
 
     Args:
-        doc (Document, optional): The Revit document to retrieve families from.
-                                  If not provided, defaults to DOCS.doc.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
         only_editable (bool, optional): If True, only returns families that are editable.
                                         Defaults to True.
 
@@ -561,16 +749,10 @@ def get_families(doc=None, only_editable=True):
               only includes families that are editable.
     """
     doc = doc or DOCS.doc
-    families = [
-        x.Family
-        for x in set(
-            DB.FilteredElementCollector(doc).WhereElementIsElementType().ToElements()
-        )
-        if isinstance(x, (DB.FamilySymbol, DB.AnnotationSymbolType))
-    ]
+    families = DB.FilteredElementCollector(doc).OfClass(DB.Family)
     if only_editable:
         return [x for x in families if x.IsEditable]
-    return families
+    return list(families)
 
 
 def get_noteblock_families(doc=None):
@@ -578,8 +760,7 @@ def get_noteblock_families(doc=None):
     Retrieves a list of noteblock families from the given Revit document.
 
     Args:
-        doc (Document, optional): The Revit document to query. If not provided,
-                                  the default document (DOCS.doc) will be used.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         list: A list of noteblock family elements in the document.
@@ -590,14 +771,19 @@ def get_noteblock_families(doc=None):
     ]
 
 
+@automation.operation(
+    "pyrevit.elements.by-family",
+    PlainEnglish="Find placed elements whose family name exactly matches a supplied name.",
+    effects=("model.read",),
+    inputs=("family_name: string",),
+)
 def get_elements_by_family(family_name, doc=None):
     """
     Retrieves elements from a Revit document based on the specified family name.
 
     Args:
         family_name (str): The name of the family to filter elements by.
-        doc (DB.Document, optional): The Revit document to search within. If not provided,
-                                     the default document (DOCS.doc) will be used.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         list[DB.Element]: A list of elements that belong to the specified family.
@@ -649,7 +835,7 @@ def find_workset(workset_name_or_list, doc=None, partial=True):
 
     Args:
         workset_name_or_list (str or list): The name of the workset to find or a list of workset names.
-        doc (Document, optional): The Revit document to search in. If None, the default document is used.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
         partial (bool, optional): If True, allows partial matching of workset names. Defaults to True.
 
     Returns:
@@ -680,7 +866,7 @@ def model_has_family(family_name, doc=None):
 
     Args:
         family_name (str): The name of the family to search for.
-        doc (Document, optional): The Revit document to search in. If None, the current document is used.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         bool: True if the family is found in the model, False otherwise.
@@ -696,7 +882,7 @@ def model_has_workset(workset_name, partial=False, doc=None):
     Args:
         workset_name (str): The name of the workset to search for.
         partial (bool, optional): If True, allows partial matching of the workset name. Defaults to False.
-        doc (Document, optional): The Revit document to search within. If None, the current document is used. Defaults to None.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         bool: True if the workset is found, False otherwise.
@@ -712,7 +898,7 @@ def get_worksets_names(doc=None):
 
 
     Args:
-        document (Document): A Revit document. de
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
 
     Returns:
@@ -734,15 +920,15 @@ def get_critical_warnings_count(warnings, critical_warnings_template):
     Counts the number of critical warnings from a list of warnings based on a template.
 
     Args:
-        warnings (list): A list of warning objects. Each warning object should have a method 
+        warnings (list): A list of warning objects. Each warning object should have a method
                          `GetFailureDefinitionId` that returns an object with a `Guid` attribute.
-        critical_warnings_template (list): A list of string representations of GUIDs that are 
+        critical_warnings_template (list): A list of string representations of GUIDs that are
                                            considered critical warnings.
 
     Returns:
         int: The count of critical warnings.
     """
-    warnings_guid = [warning.GetFailureDefinitionId().Guid for warning in warnings] 
+    warnings_guid = [warning.GetFailureDefinitionId().Guid for warning in warnings]
     return sum(
         1
         for warning_guid in warnings_guid
@@ -789,33 +975,56 @@ def get_defined_sharedparams():
     return pp_list
 
 
-def get_project_parameters(doc=None):
+def iter_project_parameters(doc=None):
     """
-    Retrieves the project parameters from the given Revit document.
+    Generator that yields project parameters from the given Revit document one at a time.
 
     Args:
-        doc (Document, optional): The Revit document from which to retrieve the project parameters.
-                                  If not provided, defaults to `DOCS.doc`.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
-    Returns:
-        list: A list of ProjectParameter objects representing the project parameters in the document.
+    Yields:
+        ProjectParameter: Individual ProjectParameter objects representing the project parameters in the document.
     """
     doc = doc or DOCS.doc
-    shared_params = {x.Name: x for x in get_defined_sharedparams()}
 
-    pp_list = []
+    # Build shared params dictionary more explicitly to avoid IronPython issues
+    shared_params = {}
+    try:
+        defined_shared_params = get_defined_sharedparams()
+        for param in defined_shared_params:
+            shared_params[param.Name] = param
+    except Exception:
+        # If shared params can't be loaded, continue with empty dict
+        pass
+
     if doc and not doc.IsFamilyDocument:
         param_bindings = doc.ParameterBindings
         pb_iterator = param_bindings.ForwardIterator()
         pb_iterator.Reset()
         while pb_iterator.MoveNext():
+            key = pb_iterator.Key
+            binding = param_bindings[key]
+            param_ext_def = shared_params.get(key.Name, None)
+
             msp = db.ProjectParameter(
-                pb_iterator.Key,
-                param_bindings[pb_iterator.Key],
-                param_ext_def=shared_params.get(pb_iterator.Key.Name, None),
+                key,
+                binding,
+                param_ext_def=param_ext_def,
             )
-            pp_list.append(msp)
-    return pp_list
+            yield msp
+
+
+def get_project_parameters(doc=None):
+    """
+    Retrieves the project parameters from the given Revit document.
+
+    Args:
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
+
+    Returns:
+        list: A list of ProjectParameter objects representing the project parameters in the document.
+    """
+    return list(iter_project_parameters(doc))
 
 
 def get_project_parameter_id(param_name, doc=None):
@@ -824,8 +1033,7 @@ def get_project_parameter_id(param_name, doc=None):
 
     Args:
         param_name (str): The name of the project parameter to find.
-        doc (Document, optional): The Revit document to search in. If not provided,
-                                  the default document (DOCS.doc) will be used.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         ElementId: The ID of the project parameter.
@@ -834,7 +1042,7 @@ def get_project_parameter_id(param_name, doc=None):
         PyRevitException: If the parameter with the specified name is not found.
     """
     doc = doc or DOCS.doc
-    for project_param in get_project_parameters(doc):
+    for project_param in iter_project_parameters(doc):
         if project_param.name == param_name:
             return project_param.param_id
     raise PyRevitException("Parameter not found: {}".format(param_name))
@@ -846,13 +1054,12 @@ def get_project_parameter(param_id_or_name, doc=None):
 
     Args:
         param_id_or_name (str or int): The ID or name of the project parameter to retrieve.
-        doc (Document, optional): The Revit document to search in. If not provided, the default document is used.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         ProjectParameter: The matching project parameter if found, otherwise None.
     """
-    pp_list = get_project_parameters(doc or DOCS.doc)
-    for msp in pp_list:
+    for msp in iter_project_parameters(doc or DOCS.doc):
         if msp == param_id_or_name:
             return msp
     return None
@@ -864,12 +1071,12 @@ def model_has_parameter(param_id_or_name, doc=None):
 
     Args:
         param_id_or_name (str or int): The parameter ID or name to check for.
-        doc (Document, optional): The Revit document to search in. If None, the current document is used.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         bool: True if the parameter exists in the model, False otherwise.
     """
-    return get_project_parameter(param_id_or_name, doc=doc)
+    return get_project_parameter(param_id_or_name, doc=doc) is not None
 
 
 def get_global_parameters(doc=None):
@@ -877,8 +1084,7 @@ def get_global_parameters(doc=None):
     Retrieves all global parameters from the given Revit document.
 
     Args:
-        doc (Document, optional): The Revit document from which to retrieve global parameters.
-                                  If not provided, defaults to DOCS.doc.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         list: A list of global parameter elements in the document.
@@ -896,7 +1102,7 @@ def get_global_parameter(param_name, doc=None):
 
     Args:
         param_name (str): The name of the global parameter to retrieve.
-        doc (DB.Document, optional): The Revit document to search in. If not provided, defaults to DOCS.doc.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         DB.GlobalParameter: The global parameter element if found, otherwise None.
@@ -913,8 +1119,7 @@ def get_project_info(doc=None):
     Retrieves the project information from the given Revit document.
 
     Args:
-        doc (Document, optional): The Revit document from which to retrieve the project information.
-                                  If not provided, the default document (DOCS.doc) will be used.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         ProjectInfo: The project information of the specified or default Revit document.
@@ -940,13 +1145,18 @@ def get_phases_names(doc=None):
     return ", ".join(phase.Name for phase in doc.Phases)
 
 
+@automation.operation(
+    "pyrevit.revisions.list",
+    PlainEnglish="List revision elements in the current document.",
+    effects=("model.read",),
+    inputs=(),
+)
 def get_revisions(doc=None):
     """
     Retrieves a list of revision elements from the given Revit document.
 
     Args:
-        doc (Document, optional): The Revit document to retrieve revisions from.
-                                  If not provided, the default document (DOCS.doc) is used.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         list: A list of revision elements in the specified Revit document.
@@ -986,6 +1196,12 @@ def get_current_sheet_revision(sheet):
     return doc.GetElement(sheet.GetCurrentRevision())
 
 
+@automation.operation(
+    "pyrevit.sheets.list",
+    PlainEnglish="List sheets, with optional placeholder and project-browser filtering.",
+    effects=("model.read",),
+    inputs=("include_placeholders: boolean?", "include_noappear: boolean?"),
+)
 def get_sheets(include_placeholders=True, include_noappear=True, doc=None):
     """
     Retrieves a list of sheets from the Revit document.
@@ -993,7 +1209,7 @@ def get_sheets(include_placeholders=True, include_noappear=True, doc=None):
     Args:
         include_placeholders (bool, optional): If True, includes placeholder sheets in the result. Defaults to True.
         include_noappear (bool, optional): If True, includes sheets that do not appear in the project browser. Defaults to True.
-        doc (Document, optional): The Revit document to retrieve sheets from. If None, uses the current document. Defaults to None.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         list: A list of sheets from the specified Revit document.
@@ -1007,7 +1223,7 @@ def get_sheets(include_placeholders=True, include_noappear=True, doc=None):
         sheets = [
             x
             for x in sheets
-            if x.Parameter[DB.BuiltInParameter.SHEET_SCHEDULED].AsInteger() > 0
+            if x.get_Parameter(DB.BuiltInParameter.SHEET_SCHEDULED).AsInteger() > 0
         ]
     if not include_placeholders:
         return [x for x in sheets if not x.IsPlaceholder]
@@ -1021,8 +1237,7 @@ def get_document_clean_name(doc=None):
     extension.
 
     Args:
-        doc (DB.Document, optional): The Revit document to retrieve links from. If None, the default document
-            (DOCS.doc) is used. Defaults to None.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         str: The name of the given document without the file path or file
@@ -1031,11 +1246,13 @@ def get_document_clean_name(doc=None):
     document_name = db.ProjectInfo(doc or DOCS.doc).path
     if not document_name:
         return "File Not Saved"
-    if document_name.startswith("BIM 360://"):
-        path = document_name.split("://", 1)[1]
-    else:
-        path = document_name
-    return splitext(basename(path))[0]
+    _CLOUD_URI_SCHEMES = ("BIM 360://", "ACC://", "Autodesk Docs://")
+    for scheme in _CLOUD_URI_SCHEMES:
+        if document_name.startswith(scheme):
+            document_name = document_name[len(scheme) :]
+            break
+
+    return splitext(basename(document_name))[0]
 
 
 def get_links(linktype=None, doc=None):
@@ -1045,8 +1262,7 @@ def get_links(linktype=None, doc=None):
     Args:
         linktype (DB.ExternalFileReferenceType, optional): The type of external file reference to filter by.
             If None, all external file references are returned. Defaults to None.
-        doc (DB.Document, optional): The Revit document to retrieve links from. If None, the default document
-            (DOCS.doc) is used. Defaults to None.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         list: A list of db.ExternalRef objects representing the external file references in the document.
@@ -1085,8 +1301,7 @@ def get_linked_models(doc=None, loaded_only=False):
     Retrieves the linked Revit models in the given document.
 
     Args:
-        doc (Document, optional): The Revit document to search for linked models.
-                                  If None, defaults to DOCS.doc.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
         loaded_only (bool, optional): If True, only returns the linked models that are currently loaded.
                                       Defaults to False.
 
@@ -1157,7 +1372,7 @@ def get_rvt_link_status(doc=None):
     Retrieves the status of linked Revit models in the given document.
 
     Args:
-        doc (Document, optional): The Revit document to query. If None, the current document is used.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         list: A list of statuses for each linked Revit model type.
@@ -1171,10 +1386,10 @@ def get_rvt_link_status(doc=None):
 def get_rvt_link_doc_name(rvtlink_instance):
     """
     Retrieves the name of the Revit link document from the given Revit link instance.
-    
+
     Args:
         rvtlink_instance: The Revit link instance from which to extract the document name.
-    
+
     Returns:
         str: The name of the Revit link document, without the file extension and any directory paths.
     """
@@ -1184,10 +1399,10 @@ def get_rvt_link_doc_name(rvtlink_instance):
 def get_rvt_link_instance_name(rvtlink_instance=None):
     """
     Retrieves the name of a Revit link instance.
-    
+
     Args:
         rvtlink_instance: The Revit link instance object.
-    
+
     Returns:
         str: The name of the Revit link instance, extracted from the full name.
     """
@@ -1199,8 +1414,7 @@ def find_first_legend(doc=None):
     Finds the first legend view in the given Revit document.
 
     Args:
-        doc (Document, optional): The Revit document to search in. If not provided,
-                                  it defaults to DOCS.doc.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         View: The first legend view found in the document, or None if no legend view is found.
@@ -1234,12 +1448,18 @@ def compare_revisions(src_rev, dest_rev, case_sensitive=False):
     )
 
 
+@automation.operation(
+    "pyrevit.views.list",
+    PlainEnglish="List Revit views with optional type and graphical-view filtering.",
+    effects=("model.read",),
+    inputs=("include_nongraphical: boolean?",),
+)
 def get_all_views(doc=None, view_types=None, include_nongraphical=False):
     """
     Retrieves all views from the given Revit document, with optional filtering by view types and graphical views.
 
     Args:
-        doc (Document, optional): The Revit document to retrieve views from. If None, defaults to DOCS.doc.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
         view_types (list, optional): A list of view types to filter the views. If None, no filtering is applied.
         include_nongraphical (bool, optional): If True, includes non-graphical views in the result. Defaults to False.
 
@@ -1272,8 +1492,7 @@ def get_all_view_templates(doc=None, view_types=None):
     Retrieves all view templates from the given Revit document.
 
     Args:
-        doc (Document, optional): The Revit document to search for view templates.
-                                  If None, the active document will be used.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
         view_types (list, optional): A list of view types to filter the views.
                                      If None, all view types will be considered.
 
@@ -1295,8 +1514,7 @@ def get_sheet_by_number(sheet_num, doc=None):
 
     Args:
         sheet_num (str): The sheet number to search for.
-        doc (Document, optional): The Revit document to search within.
-                                  If not provided, defaults to DOCS.doc.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         Element: The sheet element with the specified sheet number,
@@ -1313,7 +1531,7 @@ def get_viewport_by_number(sheet_num, detail_num, doc=None):
     Args:
         sheet_num (str): The number of the sheet containing the viewport.
         detail_num (str): The detail number of the viewport to retrieve.
-        doc (Document, optional): The Revit document to search in. If not provided, defaults to DOCS.doc.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         Element: The viewport element if found, otherwise None.
@@ -1323,9 +1541,9 @@ def get_viewport_by_number(sheet_num, detail_num, doc=None):
     if sheet:
         vps = [doc.GetElement(x) for x in sheet.GetAllViewports()]
         for vp in vps:
-            det_num = vp.Parameter[
+            det_num = vp.get_Parameter(
                 DB.BuiltInParameter.VIEWPORT_DETAIL_NUMBER
-            ].AsString()
+            ).AsString()
             if det_num == detail_num:
                 return vp
 
@@ -1337,7 +1555,7 @@ def get_view_by_sheetref(sheet_num, detail_num, doc=None):
     Args:
         sheet_num (int): The sheet number to search for.
         detail_num (int): The detail number to search for.
-        doc (Document, optional): The Revit document to search within. If not provided, defaults to DOCS.doc.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         ElementId: The ID of the view associated with the specified sheet and detail numbers, or None if not found.
@@ -1364,20 +1582,25 @@ def is_schedule(view):
         isintkeynote = view.IsInternalKeynoteSchedule
         iskeynotelegend = (
             view.Definition.CategoryId
-            == get_category(DB.BuiltInCategory.OST_KeynoteTags).Id
+            == get_category(DB.BuiltInCategory.OST_KeynoteTags, view.Document).Id
         )
 
         return not (isrevsched or isintkeynote or iskeynotelegend)
     return False
 
 
+@automation.operation(
+    "pyrevit.schedules.list",
+    PlainEnglish="List schedule views that can be placed on a sheet.",
+    effects=("model.read",),
+    inputs=(),
+)
 def get_all_schedules(doc=None):
     """
     Retrieves all schedule views from the given Revit document.
 
     Args:
-        doc (Document, optional): The Revit document to retrieve schedules from.
-                                  If not provided, defaults to DOCS.doc.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         filter: A filter object containing all schedule views in the document.
@@ -1389,7 +1612,7 @@ def get_all_schedules(doc=None):
         .WhereElementIsNotElementType()
         .ToElements()
     )
-    return filter(is_schedule, all_scheds)
+    return list(filter(is_schedule, all_scheds))
 
 
 def get_view_by_name(view_name, view_types=None, doc=None):
@@ -1399,7 +1622,7 @@ def get_view_by_name(view_name, view_types=None, doc=None):
     Args:
         view_name (str): The name of the view to retrieve.
         view_types (list, optional): A list of view types to filter the search. Defaults to None.
-        doc (Document, optional): The Revit document to search within. Defaults to the active document.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         View: The Revit view that matches the given name, or None if no match is found.
@@ -1418,8 +1641,7 @@ def get_all_referencing_elements(doc=None):
     set of view-related built-in categories.
 
     Args:
-        doc (DB.Document, optional): The Revit document to search for referencing elements.
-                                     If not provided, defaults to DOCS.doc.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         list[DB.ElementId]: A list of element IDs that reference views in the document.
@@ -1469,7 +1691,7 @@ def get_schedules_on_sheet(viewsheet, doc=None):
 
     Args:
         viewsheet (DB.ViewSheet): The Revit view sheet from which to retrieve schedule instances.
-        doc (DB.Document, optional): The Revit document. If not provided, defaults to DOCS.doc.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         list: A list of schedule instances (DB.ScheduleSheetInstance) that are placed on the given view sheet,
@@ -1490,11 +1712,10 @@ def get_schedules_on_sheet(viewsheet, doc=None):
 def get_schedules_instances(doc=None):
     """
     Retrieves all schedule instances placed on sheets.
-    
+
     Args:
-        doc (Document, optional): The Revit document to search within. If not provided, 
-                                  the default document (DOCS.doc) will be used.
-    
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
+
     Returns:
         List[ScheduleSheetInstance]: A list of ScheduleSheetInstance elements.
     """
@@ -1527,8 +1748,7 @@ def get_doc_categories(doc=None, include_subcats=True):
     Retrieves all categories from the given Revit document, optionally including subcategories.
 
     Args:
-        doc (Document, optional): The Revit document from which to retrieve categories.
-                                  If not provided, defaults to DOCS.doc.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
         include_subcats (bool, optional): Whether to include subcategories in the result.
                                           Defaults to True.
 
@@ -1550,8 +1770,7 @@ def get_schedule_categories(doc=None):
     Retrieves the categories that are valid for schedules in the given Revit document.
 
     Args:
-        doc (Document, optional): The Revit document to retrieve the schedule categories from.
-                                  If not provided, it defaults to DOCS.doc.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         list: A list of categories that are valid for schedules in the given Revit document.
@@ -1571,8 +1790,7 @@ def get_key_schedule_categories(doc=None):
     Retrieves the categories that are valid for key schedules in the given Revit document.
 
     Args:
-        doc (Document, optional): The Revit document to retrieve categories from.
-                                  If not provided, defaults to DOCS.doc.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         list: A list of categories that are valid for key schedules.
@@ -1592,8 +1810,7 @@ def get_takeoff_categories(doc=None):
     Retrieves the categories that are valid for material takeoff schedules in a given Revit document.
 
     Args:
-        doc (Document, optional): The Revit document to retrieve categories from. If not provided,
-                                  the default document (DOCS.doc) will be used.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         list: A list of categories that are valid for material takeoff schedules.
@@ -1608,57 +1825,71 @@ def get_takeoff_categories(doc=None):
     return cats
 
 
-def get_category(cat_name_or_builtin, doc=None):
+def get_category(cat_input, doc=None):
     """
-    Retrieves a Revit category based on the provided category name, built-in category, or category object.
+    Retrieves a Revit category based on the provided category name, built-in category, category object or element id.
 
     Args:
-        cat_name_or_builtin (Union[str, DB.BuiltInCategory, DB.Category]): The category name as a string,
-            a built-in category enum, or a category object.
+        cat_input (Union[str, DB.BuiltInCategory, DB.Category, DB.ElementId]): The category name as a string,
+            a BuiltInCategory name such as "OST_Walls", a built-in category enum, a category object or ElementId.
         doc (Optional[Document]): The Revit document to search within. If not provided, defaults to DOCS.doc.
 
     Returns:
         DB.Category: The matching Revit category object, or None if no match is found.
     """
     doc = doc or DOCS.doc
-    all_cats = get_doc_categories(doc)
-    if isinstance(cat_name_or_builtin, str):
-        for cat in all_cats:
-            if cat.Name == cat_name_or_builtin:
-                return cat
-    elif isinstance(cat_name_or_builtin, DB.BuiltInCategory):
+    if isinstance(cat_input, DB.Category):
+        return cat_input
+
+    if isinstance(cat_input, DB.ElementId):
         get_elementid_value = get_elementid_value_func()
-        for cat in all_cats:
-            if get_elementid_value(cat.Id) == int(cat_name_or_builtin):
+        try:
+            return doc.Settings.Categories.get_Item(
+                DB.BuiltInCategory(get_elementid_value(cat_input))
+            )
+        except Exception:
+            for cat in get_doc_categories(doc):
+                if cat.Id == cat_input:
+                    return cat
+            return None
+
+    if isinstance(cat_input, DB.BuiltInCategory):
+        return doc.Settings.Categories.get_Item(cat_input)
+
+    if isinstance(cat_input, str):
+        if cat_input.startswith("OST_") and hasattr(DB.BuiltInCategory, cat_input):
+            return doc.Settings.Categories.get_Item(
+                getattr(DB.BuiltInCategory, cat_input)
+            )
+        for cat in get_doc_categories(doc):
+            if cat.Name == cat_input:
                 return cat
-    elif isinstance(cat_name_or_builtin, DB.Category):
-        return cat_name_or_builtin
+
+    return None
 
 
-def get_builtincategory(cat_name_or_id, doc=None):
+def get_builtincategory(cat_input, doc=None):
     """
-    Retrieves the BuiltInCategory for a given category name or ElementId.
+    Retrieves the BuiltInCategory for a given category name, built-in category, category object or element id.
 
     Args:
-        cat_name_or_id (str or DB.ElementId): The name of the category as a string or the ElementId of the category.
-        doc (optional): The Revit document. If not provided, defaults to DOCS.doc.
+        cat_input (Union[str, DB.BuiltInCategory, DB.Category, DB.ElementId]): The category name as a string,
+            a built-in category enum, a category object or ElementId.
+        doc (Optional[Document]): The Revit document to search within. If not provided, defaults to DOCS.doc.
 
     Returns:
         DB.BuiltInCategory: The corresponding BuiltInCategory if found, otherwise None.
     """
-    doc = doc or DOCS.doc
-    cat_id = None
-    if isinstance(cat_name_or_id, str):
-        cat = get_category(cat_name_or_id)
-        if cat:
-            cat_id = cat.Id
-    elif isinstance(cat_name_or_id, DB.ElementId):
-        cat_id = cat_name_or_id
-    if cat_id:
-        get_elementid_value = get_elementid_value_func()
-        for bicat in DB.BuiltInCategory.GetValues(DB.BuiltInCategory):
-            if int(bicat) == get_elementid_value(cat_id):
-                return bicat
+    cat = get_category(cat_input, doc=doc)
+    if not cat:
+        return None
+
+    get_elementid_value = get_elementid_value_func()
+    cat_val = get_elementid_value(cat.Id)
+
+    for bicat in DB.BuiltInCategory.GetValues(DB.BuiltInCategory):
+        if int(bicat) == cat_val:
+            return bicat
 
 
 def get_subcategories(doc=None, purgable=False, filterfunc=None):
@@ -1666,8 +1897,7 @@ def get_subcategories(doc=None, purgable=False, filterfunc=None):
     Retrieves subcategories from the given Revit document.
 
     Args:
-        doc (Document, optional): The Revit document to retrieve subcategories from.
-                                  If None, defaults to DOCS.doc.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
         purgable (bool, optional): If True, only includes subcategories that are purgable
                                    (element ID value greater than 1). Defaults to False.
         filterfunc (function, optional): A function to filter the subcategories.
@@ -1700,7 +1930,7 @@ def get_subcategory(cat_name_or_builtin, subcategory_name, doc=None):
     Args:
         cat_name_or_builtin (str or BuiltInCategory): The name of the category or a built-in category.
         subcategory_name (str): The name of the subcategory to retrieve.
-        doc (Document, optional): The Revit document to search in. Defaults to the active document.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         Category: The subcategory if found, otherwise None.
@@ -1720,7 +1950,7 @@ def get_builtinparameter(element, param_name, doc=None):
     Args:
         element (Element): The Revit element from which to retrieve the parameter.
         param_name (str): The name of the parameter to look up.
-        doc (Document, optional): The Revit document. If not provided, defaults to DOCS.doc.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         BuiltInParameter: The built-in parameter corresponding to the given element and parameter name.
@@ -1759,8 +1989,7 @@ def get_project_location_transform(doc=None):
     Retrieves the transformation matrix of the active project location in the given Revit document.
 
     Args:
-        doc (Document, optional): The Revit document from which to get the project location transform.
-                                  If not provided, it defaults to DOCS.doc.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         Transform: The transformation matrix of the active project location.
@@ -1774,8 +2003,7 @@ def get_all_linkedmodels(doc=None):
     Retrieves all linked Revit models in the given document.
 
     Args:
-        doc (Document, optional): The Revit document to search for linked models.
-                                  If not provided, defaults to DOCS.doc.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         List[Element]: A list of RevitLinkType elements representing the linked models.
@@ -1789,8 +2017,7 @@ def get_all_linkeddocs(doc=None):
     Retrieves all linked documents in the given Revit document.
 
     Args:
-        doc (Document, optional): The Revit document to search for linked documents.
-                                  If None, it defaults to DOCS.doc.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         list: A list of linked Revit documents.
@@ -1810,7 +2037,7 @@ def get_all_grids(group_by_direction=False, include_linked_models=False, doc=Non
     Args:
         group_by_direction (bool): If True, groups the grids by their direction.
         include_linked_models (bool): If True, includes grids from linked models.
-        doc (Document, optional): The Revit document to retrieve grids from. If None, uses the current document.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         list or dict: A list of all grid elements if group_by_direction is False.
@@ -1851,7 +2078,7 @@ def get_gridpoints(grids=None, include_linked_models=False, doc=None):
     Args:
         grids (list, optional): A list of grid elements to consider. If None, all grids in the document are considered.
         include_linked_models (bool, optional): If True, includes grids from linked models. Defaults to False.
-        doc (Document, optional): The Revit document to operate on. If None, uses the current active document.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         list: A list of GridPoint objects representing the intersection points of the grid lines.
@@ -1863,10 +2090,9 @@ def get_gridpoints(grids=None, include_linked_models=False, doc=None):
     gints = {}
     for grid1 in source_grids:
         for grid2 in source_grids:
-            results = framework.clr.Reference[DB.IntersectionResultArray]()
-            intres = grid1.Curve.Intersect(grid2.Curve, results)
-            if intres == DB.SetComparisonResult.Overlap:
-                gints[db.XYZPoint(results.get_Item(0).XYZPoint)] = [grid1, grid2]
+            intres, results = geom.intersect_curves(grid1.Curve, grid2.Curve)
+            if intres == DB.SetComparisonResult.Overlap and results:
+                gints[db.XYZPoint(results[0])] = [grid1, grid2]
     return [GridPoint(point=k, grids=v) for k, v in gints.items()]
 
 
@@ -1901,7 +2127,7 @@ def get_category_set(category_list, doc=None):
 
     Args:
         category_list (list): A list of built-in categories to include in the CategorySet.
-        doc (Document, optional): The Revit document to use. If not provided, defaults to DOCS.doc.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         CategorySet: A set of categories created from the provided list.
@@ -1920,7 +2146,7 @@ def get_all_category_set(bindable=True, doc=None):
 
     Args:
         bindable (bool, optional): If True, only includes categories that allow bound parameters. Defaults to True.
-        doc (Document, optional): The Revit document to retrieve categories from. If None, uses the default document.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         CategorySet: A set of categories from the specified Revit document.
@@ -1941,8 +2167,7 @@ def get_rule_filters(doc=None):
     Retrieves a list of rule-based filters from the given Revit document.
 
     Args:
-        doc (DB.Document, optional): The Revit document to retrieve the filters from.
-                                     If not provided, defaults to DOCS.doc.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         list: A list of ParameterFilterElement instances from the document.
@@ -1974,22 +2199,12 @@ def get_connected_circuits(element, spare=False, space=False):
         circuit_types.append(DB.Electrical.CircuitType.Spare)
     if space:
         circuit_types.append(DB.Electrical.CircuitType.Space)
-    if HOST_APP.is_newer_than(
-        2021, or_equal=True
-    ):  # deprecation of ElectricalSystems in 2021
-        if element.MEPModel and element.MEPModel.GetElectricalSystems():
-            return [
-                x
-                for x in element.MEPModel.GetElectricalSystems()
-                if x.CircuitType in circuit_types
-            ]
-    else:
-        if element.MEPModel and element.MEPModel.ElectricalSystems:
-            return [
-                x
-                for x in element.MEPModel.ElectricalSystems
-                if x.CircuitType in circuit_types
-            ]
+    if element.MEPModel and element.MEPModel.GetElectricalSystems():
+        return [
+            x
+            for x in element.MEPModel.GetElectricalSystems()
+            if x.CircuitType in circuit_types
+        ]
 
 
 def get_element_categories(elements):
@@ -2013,7 +2228,7 @@ def get_category_schedules(category_or_catname, doc=None):
 
     Args:
         category_or_catname (str or Category): The category or category name to filter schedules.
-        doc (Document, optional): The Revit document to search in. Defaults to None, in which case the default document is used.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         list: A list of schedules that belong to the specified category.
@@ -2090,8 +2305,7 @@ def get_sheet_sets(doc=None):
     Retrieves all sheet sets from the given Revit document.
 
     Args:
-        doc (Document, optional): The Revit document to retrieve sheet sets from.
-                                  If not provided, defaults to DOCS.doc.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         list: A list of ViewSheetSet elements from the document.
@@ -2135,8 +2349,7 @@ def get_pointclouds(doc=None):
     Retrieves all point cloud elements from the given Revit document.
 
     Args:
-        doc (Document, optional): The Revit document to search for point cloud elements.
-                                  If not provided, defaults to DOCS.doc.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         list: A list of point cloud elements found in the specified document.
@@ -2184,7 +2397,7 @@ def get_fillpattern_element(fillpattern_name, fillpattern_target, doc=None):
     Args:
         fillpattern_name (str): The name of the fill pattern to search for.
         fillpattern_target (DB.FillPatternTarget): The target type of the fill pattern (e.g., Drafting or Model).
-        doc (DB.Document, optional): The Revit document to search in. If not provided, defaults to DOCS.doc.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         DB.FillPatternElement: The FillPatternElement that matches the given name and target, or None if not found.
@@ -2209,7 +2422,7 @@ def get_all_fillpattern_elements(fillpattern_target, doc=None):
 
     Args:
         fillpattern_target (DB.FillPatternTarget): The target fill pattern to match.
-        doc (DB.Document, optional): The Revit document to search within. If not provided, defaults to DOCS.doc.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         list: A list of fill pattern elements that match the specified fill pattern target.
@@ -2226,6 +2439,24 @@ def get_all_fillpattern_elements(fillpattern_target, doc=None):
     ]
 
 
+def get_solid_fillpattern_element(doc=None):
+    """
+    Returns the solid-fill drafting fill pattern element.
+
+    Args:
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
+
+    Returns:
+        DB.FillPatternElement or None: The FillPatternElement of the solid drafting fill
+        pattern if found; otherwise ``None``.
+    """
+    doc = doc or DOCS.doc
+    patterns = get_all_fillpattern_elements(DB.FillPatternTarget.Drafting, doc=doc)
+    for fp in patterns:
+        if fp.GetFillPattern().IsSolidFill:
+            return fp
+
+
 def get_fillpattern_from_element(element, background=True, doc=None):
     """
     Retrieves the fill pattern from a given Revit element.
@@ -2235,7 +2466,7 @@ def get_fillpattern_from_element(element, background=True, doc=None):
         background (bool, optional): If True, retrieves the background fill pattern;
                                      otherwise, retrieves the foreground fill pattern.
                                      Defaults to True.
-        doc (DB.Document, optional): The Revit document. If not provided, defaults to DOCS.doc.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         DB.FillPattern: The fill pattern of the specified element, or None if not found.
@@ -2243,14 +2474,7 @@ def get_fillpattern_from_element(element, background=True, doc=None):
     doc = doc or DOCS.doc
 
     def get_fpm_from_frtype(etype):
-        fp_id = None
-        if HOST_APP.is_newer_than(2018):
-            # return requested fill pattern (background or foreground)
-            fp_id = (
-                etype.BackgroundPatternId if background else etype.ForegroundPatternId
-            )
-        else:
-            fp_id = etype.FillPatternId
+        fp_id = etype.BackgroundPatternId if background else etype.ForegroundPatternId
         if fp_id:
             fillpat_element = doc.GetElement(fp_id)
             if fillpat_element:
@@ -2265,7 +2489,7 @@ def get_local_keynote_file(doc=None):
     Retrieves the path to the local keynote file for the given Revit document.
 
     Args:
-        doc (DB.Document, optional): The Revit document. If not provided, the default document (DOCS.doc) is used.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         str: The user-visible path to the local keynote file if it is an external file reference, otherwise None.
@@ -2308,8 +2532,7 @@ def get_keynote_file(doc=None):
     Otherwise, it returns the external keynote file path.
 
     Args:
-        doc (Document, optional): The Revit document. If not provided,
-                                  the default document (DOCS.doc) is used.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         str: The path to the keynote file.
@@ -2326,8 +2549,7 @@ def get_used_keynotes(doc=None):
     Retrieves all keynote tags used in the given Revit document.
 
     Args:
-        doc (Document, optional): The Revit document to search for keynote tags.
-                                  If not provided, defaults to DOCS.doc.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         List[Element]: A list of keynote tag elements found in the document.
@@ -2381,8 +2603,7 @@ def get_available_keynotes_tree(doc=None):
     Retrieves the available keynotes in a hierarchical tree structure.
 
     Args:
-        doc (Document, optional): The Revit document to retrieve keynotes from.
-                                  If not provided, defaults to the current document.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         dict: A dictionary representing the hierarchical structure of keynotes.
@@ -2421,7 +2642,7 @@ def get_central_path(doc=None):
     Returns the central model path of a Revit document if it is workshared.
 
     Args:
-        doc (Document, optional): The Revit document. If not provided, defaults to DOCS.doc.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         str: The user-visible path to the central model if the document is workshared.
@@ -2437,8 +2658,7 @@ def is_metric(doc=None):
     Determines if the given Revit document uses the metric unit system.
 
     Args:
-        doc (Document, optional): The Revit document to check. If not provided,
-                                  the default document (DOCS.doc) will be used.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         bool: True if the document uses the metric unit system, False otherwise.
@@ -2452,8 +2672,7 @@ def is_imperial(doc=None):
     Checks if the given Revit document uses the imperial unit system.
 
     Args:
-        doc (Document, optional): The Revit document to check. If not provided,
-                                  the default document (DOCS.doc) will be used.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         bool: True if the document uses the imperial unit system, False otherwise.
@@ -2480,9 +2699,11 @@ def get_view_sheetrefinfo(view):
         SheetRefInfo: An object containing the sheet number, sheet name, detail
                       number, and reference view ID if applicable.
     """
-    sheet_num = view.Parameter[DB.BuiltInParameter.VIEWPORT_SHEET_NUMBER].AsString()
-    sheet_name = view.Parameter[DB.BuiltInParameter.VIEWPORT_SHEET_NAME].AsString()
-    detail_num = view.Parameter[DB.BuiltInParameter.VIEWPORT_DETAIL_NUMBER].AsString()
+    sheet_num = view.get_Parameter(DB.BuiltInParameter.VIEWPORT_SHEET_NUMBER).AsString()
+    sheet_name = view.get_Parameter(DB.BuiltInParameter.VIEWPORT_SHEET_NAME).AsString()
+    detail_num = view.get_Parameter(
+        DB.BuiltInParameter.VIEWPORT_DETAIL_NUMBER
+    ).AsString()
 
     if sheet_num:
         return SheetRefInfo(
@@ -2491,14 +2712,14 @@ def get_view_sheetrefinfo(view):
             detail_num=detail_num,
             ref_viewid=None,
         )
-    ref_sheet_num = view.Parameter[
+    ref_sheet_num = view.get_Parameter(
         DB.BuiltInParameter.VIEW_REFERENCING_SHEET
-    ].AsString()
+    ).AsString()
     ref_sheet = get_sheet_by_number(ref_sheet_num)
     ref_sheet_name = get_name(ref_sheet) if ref_sheet else ""
-    ref_detail_num = view.Parameter[
+    ref_detail_num = view.get_Parameter(
         DB.BuiltInParameter.VIEW_REFERENCING_DETAIL
-    ].AsString()
+    ).AsString()
     if ref_sheet_num:
         return SheetRefInfo(
             sheet_num=ref_sheet_num,
@@ -2513,7 +2734,7 @@ def get_all_sheeted_views(doc=None, sheets=None):
     Retrieves all view IDs that are placed on sheets in the given Revit document.
 
     Args:
-        doc (Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
         sheets (list, optional): A list of sheet elements to query. If not provided, defaults to all sheets in the document.
 
     Returns:
@@ -2570,9 +2791,9 @@ def is_referring_to(source_view, target_view):
     if can_refer_other_views(source_view):
         for ref_elid in get_all_referencing_elements_in_view(source_view):
             viewref_el = doc.GetElement(ref_elid)
-            targetview_param = viewref_el.Parameter[
+            targetview_param = viewref_el.get_Parameter(
                 DB.BuiltInParameter.REFERENCE_VIEWER_TARGET_VIEW
-            ]
+            )
             if targetview_param:
                 tvp_view = doc.GetElement(targetview_param.AsElementId())
                 if tvp_view and get_name(tvp_view) == target_viewname:
@@ -2605,7 +2826,7 @@ def yield_referenced_views(doc=None, all_views=None):
     Yields the IDs of views that have referring views.
 
     Args:
-        doc (Document, optional): The Revit document to query. Defaults to None, in which case the global DOCS.doc is used.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
         all_views (list, optional): A list of all views in the document. Defaults to None, in which case all views are retrieved using get_all_views(doc).
     Yields:
         ElementId: The ID of a view that has referring views.
@@ -2623,8 +2844,7 @@ def yield_unreferenced_views(doc=None, all_views=None):
     Yields the IDs of views in a Revit document that have no referring views.
 
     Args:
-        doc (Document, optional): The Revit document to search for unreferenced views.
-                                  If not provided, defaults to DOCS.doc.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
         all_views (list, optional): A list of all views in the document.
                                     If not provided, it will be retrieved using get_all_views(doc).
     Yields:
@@ -2643,8 +2863,7 @@ def get_line_categories(doc=None):
     Retrieves the line categories from the given Revit document.
 
     Args:
-        doc (Document, optional): The Revit document to retrieve the line categories from.
-                                  If not provided, it defaults to DOCS.doc.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         SubCategories: The subcategories of the line category in the Revit document.
@@ -2659,8 +2878,7 @@ def get_line_styles(doc=None):
     Retrieves the line styles from the given Revit document.
 
     Args:
-        doc (Document, optional): The Revit document to retrieve line styles from.
-                                  If None, the current document will be used.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         list: A list of GraphicsStyle objects representing the line styles in the document.
@@ -2838,6 +3056,72 @@ def get_family_parameters(family_doc):
         raise PyRevitException("Document is not a family")
 
 
+REFERENCE_PLANE_REFERENCES = {
+    "left": 0,
+    "center_left_right": 1,
+    "right": 2,
+    "front": 3,
+    "center_front_back": 4,
+    "back": 5,
+    "bottom": 6,
+    "center_elevation": 7,
+    "top": 8,
+    "not_a_reference": 12,
+    "strong": 13,
+    "weak": 14,
+}
+
+
+def get_reference_plane(reference, doc=None):
+    """Find the reference plane of a family by its "Is Reference" setting.
+
+    The planes that a family template ships with are named in the language of
+    Revit (``Center (Left/Right)`` is ``Mitte (Links/rechts)`` in German), but
+    their "Is Reference" setting is the same in every language.
+
+    Args:
+        reference (str): a key of ``REFERENCE_PLANE_REFERENCES`` such as
+            ``"center_left_right"``.
+        doc (DB.Document, optional): family document, defaults to the active one.
+
+    Returns:
+        (DB.ReferencePlane): the plane with that setting.
+
+    Raises:
+        PyRevitException: outside a family document, for an unknown
+            ``reference``, or when no plane or more than one plane has that
+            setting. Only ``"strong"``, ``"weak"`` and ``"not_a_reference"``
+            can be on several planes; Revit keeps every other setting on one
+            plane per family.
+
+    Note:
+        The ``REFERENCE_PLANE_REFERENCES`` values were checked in Revit 2024
+        and 2026.
+    """
+    doc = doc or DOCS.doc
+    if not doc.IsFamilyDocument:
+        raise PyRevitException("Reference planes are looked up in a family document.")
+    if reference not in REFERENCE_PLANE_REFERENCES:
+        raise PyRevitException(
+            "reference must be one of {}.".format(
+                ", ".join(sorted(REFERENCE_PLANE_REFERENCES))
+            )
+        )
+    wanted = REFERENCE_PLANE_REFERENCES[reference]
+    matches = []
+    for plane in DB.FilteredElementCollector(doc).OfClass(DB.ReferencePlane):
+        setting = plane.get_Parameter(DB.BuiltInParameter.ELEM_REFERENCE_NAME)
+        if setting is not None and setting.AsInteger() == wanted:
+            matches.append(plane)
+    if len(matches) != 1:
+        raise PyRevitException(
+            "Expected one reference plane with Is Reference {!r}, found {}.".format(
+                reference, len(matches)
+            )
+        )
+    return matches[0]
+
+
 def get_family_label_parameters(family_doc):
     """
     Retrieves the set of family label parameters from a given Revit family document.
@@ -2922,8 +3206,7 @@ def get_all_print_settings(doc=None):
     Retrieves all print settings from the given Revit document.
 
     Args:
-        doc (Document, optional): The Revit document from which to retrieve print settings.
-                                  If not provided, defaults to DOCS.doc.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         list: A list of print settings elements from the document.
@@ -2937,7 +3220,7 @@ def get_used_paper_sizes(doc=None):
     Retrieves a list of used paper sizes from the print settings in the given Revit document.
 
     Args:
-        doc (Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         list: A list of paper sizes used in the print settings of the document.
@@ -2952,8 +3235,7 @@ def find_paper_size_by_name(paper_size_name, doc=None):
 
     Args:
         paper_size_name (str): The name of the paper size to find.
-        doc (Document, optional): The Revit document to search in. If not provided,
-                                  the default document (DOCS.doc) will be used.
+        doc (DB.Document, optional): The Revit document to query. If not provided, defaults to DOCS.doc.
 
     Returns:
         PaperSize: The paper size object that matches the given name, or None if not found.
@@ -3021,8 +3303,8 @@ def get_titleblock_print_settings(tblock, printer_name, doc_psettings):
         list[DB.PrintSetting]: A sorted list of print settings that match the title block size and orientation.
     """
     doc = tblock.Document
-    page_width_param = tblock.Parameter[DB.BuiltInParameter.SHEET_WIDTH]
-    page_height_param = tblock.Parameter[DB.BuiltInParameter.SHEET_HEIGHT]
+    page_width_param = tblock.get_Parameter(DB.BuiltInParameter.SHEET_WIDTH)
+    page_height_param = tblock.get_Parameter(DB.BuiltInParameter.SHEET_HEIGHT)
     page_width = int(round(page_width_param.AsDouble() * 12.0))
     page_height = int(round(page_height_param.AsDouble() * 12.0))
     tform = tblock.GetTotalTransform()
@@ -3062,17 +3344,8 @@ def get_crop_region(view):
         (list[DB.CurveLoop]): list of curve loops
     """
     crsm = view.GetCropRegionShapeManager()
-    if HOST_APP.is_newer_than(2015):
-        crsm_valid = crsm.CanHaveShape
-    else:
-        crsm_valid = crsm.Valid
-
-    if crsm_valid:
-        if HOST_APP.is_newer_than(2015):
-            curve_loops = list(crsm.GetCropShape())
-        else:
-            curve_loops = [crsm.GetCropRegionShape()]
-
+    if crsm.CanHaveShape:
+        curve_loops = list(crsm.GetCropShape())
         if curve_loops:
             return curve_loops
 
@@ -3097,20 +3370,28 @@ def is_cropable_view(view):
     )
 
 
-def get_view_filters(view):
+def get_view_filters(view, ordered=True):
     """
     Retrieves the filters applied to a given Revit view.
 
     Args:
         view (Autodesk.Revit.DB.View): The Revit view from which to retrieve the filters.
+        ordered (bool, optional): If True, returns filters in their proper order using GetOrderedFilters().
+                                 If False, returns filters in arbitrary order using GetFilters().
+                                 Defaults to True.
 
     Returns:
         list[Autodesk.Revit.DB.Element]: A list of filter elements applied to the view.
     """
     view_filters = []
-    for filter_id in view.GetFilters():
-        filter_element = view.Document.GetElement(filter_id)
-        view_filters.append(filter_element)
+    if ordered:
+        for filter_id in view.GetOrderedFilters():
+            filter_element = view.Document.GetElement(filter_id)
+            view_filters.append(filter_element)
+    else:
+        for filter_id in view.GetFilters():
+            filter_element = view.Document.GetElement(filter_id)
+            view_filters.append(filter_element)
     return view_filters
 
 
@@ -3130,7 +3411,12 @@ def get_element_workset(element):
         return workset_table.GetWorkset(element.WorksetId)
 
 
-def get_geometry(element, include_invisible=False, compute_references=False):
+def get_geometry(
+    element,
+    include_invisible=False,
+    compute_references=False,
+    detail_level=DB.ViewDetailLevel.Medium,
+):
     """
     Retrieves the geometry of a given Revit element.
 
@@ -3138,6 +3424,7 @@ def get_geometry(element, include_invisible=False, compute_references=False):
         element (DB.Element): The Revit element from which to retrieve geometry.
         include_invisible (bool, optional): If True, includes non-visible objects in the geometry. Defaults to False.
         compute_references (bool, optional): If True, computes references for the geometry objects. Defaults to False.
+        detail_level (DB.ViewDetailLevel, optional): The detail level used for geometry extraction. Defaults to medium.
 
     Returns:
         list: A list of geometry objects associated with the element. If the element has no geometry, returns None.
@@ -3152,6 +3439,7 @@ def get_geometry(element, include_invisible=False, compute_references=False):
     geom_opts = DB.Options()
     geom_opts.IncludeNonVisibleObjects = include_invisible
     geom_opts.ComputeReferences = compute_references
+    geom_opts.DetailLevel = detail_level
     geom_objs = []
     try:
         for gobj in element.Geometry[geom_opts]:
@@ -3199,3 +3487,404 @@ def get_array_group_ids_types(doc=None):
     """
     arrays_groups = get_array_group_ids(doc or DOCS.doc)
     return {doc.GetElement(ar).GetTypeId() for ar in arrays_groups}
+
+
+def get_elements_bounding_box(elements, view=None, padding=0.0):
+    """
+    Compute a combined BoundingBoxXYZ enclosing all given elements.
+
+    Args:
+        elements (Iterable[DB.Element]): Elements to include in the bounding box.
+        view (DB.View, optional): If provided, retrieves view-specific bounding
+            boxes (e.g. cut geometry). If None, model geometry is used.
+        padding (float, optional): Extra offset applied in all directions,
+            in Revit internal units (feet). Default is 0.0.
+
+    Returns:
+        DB.BoundingBoxXYZ | None:
+            A new BoundingBoxXYZ enclosing all valid element bounding boxes,
+            expanded by the given padding.
+            Returns None if no elements have a valid bounding box.
+    """
+    if not elements:
+        return None
+
+    min_x = min_y = min_z = float("inf")
+    max_x = max_y = max_z = float("-inf")
+
+    for elem in elements:
+        try:
+            bbox = elem.get_BoundingBox(view)
+            if not bbox:
+                continue
+
+            min_pt = bbox.Min
+            max_pt = bbox.Max
+
+            min_x = min(min_x, min_pt.X)
+            min_y = min(min_y, min_pt.Y)
+            min_z = min(min_z, min_pt.Z)
+            max_x = max(max_x, max_pt.X)
+            max_y = max(max_y, max_pt.Y)
+            max_z = max(max_z, max_pt.Z)
+
+        except Exception:
+            continue
+
+    if min_x == float("inf"):
+        return None
+
+    new_bbox = DB.BoundingBoxXYZ()
+
+    new_bbox.Min = DB.XYZ(min_x - padding, min_y - padding, min_z - padding)
+    new_bbox.Max = DB.XYZ(max_x + padding, max_y + padding, max_z + padding)
+
+    return new_bbox
+
+
+FIND_LISTING_LIMIT = 40
+
+UNFRAMED_MODEL_CATEGORIES = (
+    "OST_ProjectBasePoint",
+    "OST_SharedBasePoint",
+    "OST_Cameras",
+    "OST_SectionBox",
+    "OST_Sun",
+    "OST_VolumeOfInterest",
+    "OST_Sheets",
+    "OST_Topography",
+    "OST_Toposolid",
+    "OST_RvtLinks",
+)
+
+
+def _name_listing(names):
+    names = sorted(set(name for name in names if name))
+    shown = ", ".join(names[:FIND_LISTING_LIMIT])
+    if len(names) > FIND_LISTING_LIMIT:
+        shown += ", ... ({} more)".format(len(names) - FIND_LISTING_LIMIT)
+    return shown or "(none)"
+
+
+@automation.operation(
+    "pyrevit.levels.resolve",
+    PlainEnglish="Find a level by name and list valid levels when it is missing.",
+    effects=("model.read",),
+)
+def find_level(level_name=None, doc=None):
+    """Return a level by name, or raise an error that lists the existing levels.
+
+    Unlike the ``get_*`` functions, which return None when nothing matches,
+    the ``find_*`` functions raise, so a misspelled name stops a script
+    instead of passing None on.
+
+    Args:
+        level_name (str | DB.Level | DB.ElementId, optional): level name, level
+            or level id. When omitted, the active plan's level, else the
+            lowest level.
+        doc (DB.Document, optional): document, defaults to the active one.
+
+    Returns:
+        (DB.Level): the level.
+
+    Raises:
+        PyRevitException: when no level has that name, or the document has
+            no levels.
+    """
+    if isinstance(level_name, DB.Level):
+        return level_name
+    doc = doc or DOCS.doc
+    if isinstance(level_name, DB.ElementId):
+        level = doc.GetElement(level_name)
+        if isinstance(level, DB.Level):
+            return level
+        raise PyRevitException("Element {} is not a level.".format(level_name))
+    levels = sorted(
+        DB.FilteredElementCollector(doc).OfClass(DB.Level).ToElements(),
+        key=lambda level: level.Elevation,
+    )
+    if not levels:
+        raise PyRevitException("The document has no levels.")
+    if level_name is None:
+        active_level = getattr(doc.ActiveView, "GenLevel", None)
+        return active_level if active_level is not None else levels[0]
+    for level in levels:
+        if get_name(level) == level_name:
+            return level
+    raise PyRevitException(
+        "No level named {!r}. Levels: {}.".format(
+            level_name, _name_listing(get_name(level) for level in levels)
+        )
+    )
+
+
+@automation.operation(
+    "pyrevit.types.resolve",
+    PlainEnglish="Find an element type by class and exact name.",
+    effects=("model.read",),
+)
+def find_type(type_class, type_name, doc=None):
+    """Return an element type of a class by exact name, or raise listing the names.
+
+    Args:
+        type_class (type): element type class, such as ``DB.WallType``,
+            ``DB.FloorType``, ``DB.RoofType`` or ``DB.CeilingType``.
+        type_name (str | DB.ElementType): type name.
+        doc (DB.Document, optional): document, defaults to the active one.
+
+    Returns:
+        (DB.ElementType): the type.
+
+    Raises:
+        PyRevitException: when no type of that class has the name.
+    """
+    if isinstance(type_name, DB.ElementType):
+        return type_name
+    types = get_types_by_class(type_class, doc=doc or DOCS.doc)
+    for element_type in types:
+        if get_name(element_type) == type_name:
+            return element_type
+    raise PyRevitException(
+        "No {} named {!r}. Available: {}.".format(
+            type_class.__name__, type_name, _name_listing(get_name(t) for t in types)
+        )
+    )
+
+
+@automation.operation(
+    "pyrevit.family-symbols.resolve",
+    PlainEnglish="Find a family type by name, family and optional category.",
+    effects=("model.read",),
+    inputs=("symbol_name: string", "family_name: string?", "category: string?"),
+)
+def find_family_symbol(symbol_name, family_name=None, category=None, doc=None):
+    """Return a family type by name, or raise listing the family types.
+
+    Args:
+        symbol_name (str | DB.FamilySymbol): family type name, such as
+            ``36" x 84"``, or ``"Family : Type"`` when ``family_name``
+            is omitted.
+        family_name (str, optional): family name, required when several
+            families have a type with that name.
+        category (str | DB.BuiltInCategory | DB.Category, optional): limit
+            the search to a category, such as ``"OST_Doors"``.
+        doc (DB.Document, optional): document, defaults to the active one.
+
+    Returns:
+        (DB.FamilySymbol): the family type. It may be inactive; activate it
+        inside a transaction before placing it, or use the ``create.place_*``
+        functions, which do.
+
+    Raises:
+        PyRevitException: when nothing matches, or the name is ambiguous
+            without ``family_name``.
+    """
+    if isinstance(symbol_name, DB.FamilySymbol):
+        return symbol_name
+    if family_name is None and " : " in symbol_name:
+        family_name, symbol_name = symbol_name.split(" : ", 1)
+    doc = doc or DOCS.doc
+    collector = DB.FilteredElementCollector(doc).OfClass(DB.FamilySymbol)
+    if category is not None:
+        category_element = get_category(category, doc=doc)
+        if category_element is None:
+            raise PyRevitException("No category {!r}.".format(category))
+        collector = collector.OfCategoryId(category_element.Id)
+    candidates = [
+        symbol
+        for symbol in collector
+        if family_name is None or symbol.FamilyName == family_name
+    ]
+    matches = [symbol for symbol in candidates if get_name(symbol) == symbol_name]
+    if not matches:
+        raise PyRevitException(
+            "No family type {!r}{}. Available: {}.".format(
+                symbol_name,
+                " in family {!r}".format(family_name) if family_name else "",
+                _name_listing(
+                    "{} : {}".format(symbol.FamilyName, get_name(symbol))
+                    for symbol in candidates
+                ),
+            )
+        )
+    families = sorted(set(symbol.FamilyName for symbol in matches))
+    if len(families) > 1:
+        raise PyRevitException(
+            "Several families have a type named {!r}: {}. Pass family_name.".format(
+                symbol_name, ", ".join(families)
+            )
+        )
+    return matches[0]
+
+
+@automation.operation(
+    "pyrevit.views.resolve",
+    PlainEnglish="Find a Revit view by name or id.",
+    effects=("model.read",),
+    inputs=("view_name_or_id: scalar",),
+)
+def find_view(view_name_or_id, doc=None):
+    """Return a view (or view template) by name or id, or raise listing similar names.
+
+    Args:
+        view_name_or_id (str | int | DB.ElementId | DB.View): view name or id.
+        doc (DB.Document, optional): document, defaults to the active one.
+
+    Returns:
+        (DB.View): the view.
+
+    Raises:
+        PyRevitException: when no view has that name or id.
+    """
+    if isinstance(view_name_or_id, DB.View):
+        return view_name_or_id
+    if isinstance(view_name_or_id, bool):
+        raise PyRevitException(
+            "A view name or id is required, not {}.".format(view_name_or_id)
+        )
+    doc = doc or DOCS.doc
+    if isinstance(view_name_or_id, (numbers.Integral, DB.ElementId)):
+        try:
+            element_id = (
+                view_name_or_id
+                if isinstance(view_name_or_id, DB.ElementId)
+                else get_elementid_from_value_func()(view_name_or_id)
+            )
+        except (OverflowError, TypeError, ValueError):
+            raise PyRevitException("No view with id {}.".format(view_name_or_id))
+        view = doc.GetElement(element_id)
+        if isinstance(view, DB.View):
+            return view
+        raise PyRevitException("No view with id {}.".format(view_name_or_id))
+    views = DB.FilteredElementCollector(doc).OfClass(DB.View).ToElements()
+    for view in views:
+        if get_name(view) == view_name_or_id:
+            return view
+    words = [word for word in str(view_name_or_id).lower().split() if len(word) > 2]
+    similar = [
+        name
+        for name in (get_name(view) for view in views)
+        if any(w in name.lower() for w in words)
+    ]
+    raise PyRevitException(
+        "No view named {!r}. Similar: {}.".format(
+            view_name_or_id, _name_listing(similar)
+        )
+    )
+
+
+@automation.operation(
+    "pyrevit.plan-views.resolve",
+    PlainEnglish="Find a floor plan for a level.",
+    effects=("model.read",),
+    inputs=("level: string",),
+)
+def find_plan_view(level, doc=None):
+    """Return a floor plan of a level, or raise when the level has none.
+
+    Args:
+        level (DB.Level | str): level or level name.
+        doc (DB.Document, optional): document, defaults to the active one.
+
+    Returns:
+        (DB.ViewPlan): a non-template floor plan generated from the level.
+
+    Raises:
+        PyRevitException: when the level has no floor plan.
+    """
+    doc = doc or DOCS.doc
+    level = find_level(level, doc=doc)
+    for view in DB.FilteredElementCollector(doc).OfClass(DB.ViewPlan):
+        if (
+            not view.IsTemplate
+            and view.ViewType == DB.ViewType.FloorPlan
+            and view.GenLevel is not None
+            and view.GenLevel.Id == level.Id
+        ):
+            return view
+    raise PyRevitException(
+        "Level {!r} has no floor plan; create one with "
+        "create.create_plan_view(level).".format(get_name(level))
+    )
+
+
+def get_model_elements(doc=None):
+    """Return the elements that make up the model, for framing and extents.
+
+    Model-category, non-view-specific instances with a bounding box.
+    Levels, base points, cameras, section boxes, sun paths, scope boxes,
+    sheets, topography and links are left out, because their extents are far larger
+    than the building.
+
+    Args:
+        doc (DB.Document, optional): document, defaults to the active one.
+
+    Returns:
+        (list[DB.Element]): model elements.
+    """
+    doc = doc or DOCS.doc
+    unframed = set(
+        DB.ElementId(getattr(DB.BuiltInCategory, name))
+        for name in UNFRAMED_MODEL_CATEGORIES
+        if hasattr(DB.BuiltInCategory, name)
+    )
+    return [
+        element
+        for element in DB.FilteredElementCollector(doc).WhereElementIsNotElementType()
+        if element.Category is not None
+        and element.Category.CategoryType == DB.CategoryType.Model
+        and not element.ViewSpecific
+        and not isinstance(element, DB.Level)
+        and element.Category.Id not in unframed
+        and element.get_BoundingBox(None) is not None
+    ]
+
+
+def get_face_references(element, direction):
+    """Return references to an element's planar faces that face a direction.
+
+    For dimensioning walls, floors and other host elements to their faces.
+
+    Args:
+        element (DB.Element): element whose faces to find.
+        direction (DB.XYZ): outward face normal to match, such as
+            ``DB.XYZ.BasisX`` for faces looking east or ``-DB.XYZ.BasisY``
+            for faces looking south.
+
+    Returns:
+        (list[DB.Reference]): references of the matching faces, outermost
+        first (furthest along ``direction``), so ``[0]`` is the outer face.
+
+    Raises:
+        PyRevitException: when the element has no planar face facing that
+            way.
+
+    Note:
+        Family instances such as doors return instance geometry, whose
+        references can't be dimensioned; use
+        ``instance.GetReferences(DB.FamilyInstanceReferenceType.CenterLeftRight)``
+        for them instead.
+    """
+    direction = direction.Normalize()
+    faces = []
+    for geometry in get_geometry(element, compute_references=True) or []:
+        if not isinstance(geometry, DB.Solid) or geometry.Volume == 0:
+            continue
+        for face in geometry.Faces:
+            if (
+                isinstance(face, DB.PlanarFace)
+                and face.Reference is not None
+                and face.FaceNormal.IsAlmostEqualTo(direction)
+            ):
+                faces.append(face)
+    if not faces:
+        raise PyRevitException(
+            "Element {} has no planar face facing ({:.2f}, {:.2f}, {:.2f}).".format(
+                get_elementid_value_func()(element.Id),
+                direction.X,
+                direction.Y,
+                direction.Z,
+            )
+        )
+    faces.sort(key=lambda face: face.Origin.DotProduct(direction), reverse=True)
+    return [face.Reference for face in faces]

@@ -5,6 +5,7 @@ using System.Windows.Media;
 
 using pyRevitLabs.NLog;
 using pyRevitLabs.Common;
+using pyRevitLabs.Configurations.Security;
 
 namespace pyRevitLabs.PyRevit {
     public static class PyRevitConsts {
@@ -16,10 +17,6 @@ namespace pyRevitLabs.PyRevit {
         public static string DefaultCopyInstallName = string.Format("{0}Copy", PyRevitLabsConsts.ProductName);
 
         public static string ExtensionsDefinitionFileUri = string.Format(@"https://github.com/pyrevitlabs/pyRevit/raw/{0}/extensions/{1}", PyRevitLabsConsts.TargetBranch, ExtensionsDefFileName);
-
-        // cli
-        public const string CLIHelpUrl = @"https://github.com/pyrevitlabs/pyRevit/blob/cli-v{0}/docs/cli.md";
-        public const string CLIHelpUrlDev = @"https://github.com/pyrevitlabs/pyRevit/blob/develop/docs/cli.md";
 
         // api
         public const string ReleasePrefix = "v";
@@ -42,7 +39,7 @@ namespace pyRevitLabs.PyRevit {
         public const string ReleaseDirName = "release";
         public const string SitePackagesDirName = "site-packages";
         public const string PyRevitfileFilename = "PyRevitfile";
-        
+
         public const string NetFxFolder = "netfx";
         public const string NetCoreFolder = "netcore";
 
@@ -57,11 +54,18 @@ namespace pyRevitLabs.PyRevit {
         public const string VendorId = "eirannejad";
         public const string LegacyEngineDllName = "pyRevitLoader.dll";
 
+        public const string LaunchManifestEnvVar = "PYREVIT_LAUNCH_MANIFEST";
+        public const string LaunchRevitYearEnvVar = "PYREVIT_LAUNCH_REVIT_YEAR";
+        public const string LaunchDirName = "launch";
+
+        // install scope marker (all-users installer creates this under %ProgramData%\pyRevit\)
+        public const string InstallAllUsersMarkerFileName = PyRevitLabsConsts.InstallAllUsersMarkerFileName;
+
         // core configs
         public const string ConfigsTrueString = "true";
         public const string ConfigsFalseString = "false";
-        public const string DefaultConfigsFileName = @"pyRevit_config.ini";
-        public const string ConfigsFileRegexPattern = @".*[pyrevit|config].*\.ini";
+        public const string DefaultConfigsFileName = PyRevitLabsConsts.DefaultConfigsFileName;
+        public const string ConfigsFileRegexPattern = @".*(pyrevit|config).*\.ini";
 
         public const string ConfigsCoreSection = "core";
         public const string ConfigsBinaryCacheKey = "bincache";
@@ -85,6 +89,12 @@ namespace pyRevitLabs.PyRevit {
         public const int ConfigsMinDriveSpaceDefault = 0;
         public const string ConfigsLoadBetaKey = "loadbeta";
         public const bool ConfigsLoadBetaDefault = false;
+        public const string ConfigsCloseOtherOutputsKey = "closeotheroutputs";
+        public const bool ConfigsCloseOtherOutputsDefault = false;
+        public const string ConfigsCloseOutputModeKey = "closeoutputmode";
+        public const string ConfigsCloseOutputModeDefault = "currentcommand";
+        public const string ConfigsCloseOutputModeCurrentCommand = "currentcommand";
+        public const string ConfigsCloseOutputModeCloseAll = "closeall";
         public const string ConfigsCPythonEngineKey = "cpyengine";
         public const int ConfigsCPythonEngineDefault = 0;
         public const string ConfigsLocaleKey = "user_locale";
@@ -111,6 +121,31 @@ namespace pyRevitLabs.PyRevit {
         public const string ConfigsLoadCoreAPIKey = "core_api";
         public const bool ConfigsConfigsLoadCoreAPIDefault = false;
 
+        public const string ConfigsAgentSection = "agent";
+        public const string ConfigsAgentEnabledKey = "enabled";
+        public const bool ConfigsAgentEnabledDefault = false;
+        public const string ConfigsAgentPolicyKey = "policy";
+        public const string ConfigsAgentPolicyReadOnly = "readonly";
+        public const string ConfigsAgentPolicyAsk = "ask";
+        public const string ConfigsAgentPolicyAuto = "auto";
+        public const string ConfigsAgentPolicyDefault = ConfigsAgentPolicyAsk;
+        public const string ConfigsAgentEngineKey = "engine";
+        public const string ConfigsAgentEngineIronPython = "ironpython";
+        public const string ConfigsAgentEngineCPython = "cpython";
+        public const string ConfigsAgentEngineDefault = ConfigsAgentEngineIronPython;
+        public const string ConfigsAgentUserSkillsEnabledKey = "user_skills";
+        public const bool ConfigsAgentUserSkillsEnabledDefault = false;
+        /// <summary>
+        /// Runs agent scripts without the in-script timeout and transaction checks. Off unless
+        /// the user opts in.
+        /// </summary>
+        public const string ConfigsAgentRecklessKey = "reckless";
+        public const bool ConfigsAgentRecklessDefault = false;
+        /// <summary>Controls the temporary accent overlay on the document used by an agent run.</summary>
+        public const string ConfigsAgentTabHighlightKey = "tab_highlight";
+        /// <summary>Agent document identification is enabled unless explicitly disabled.</summary>
+        public const bool ConfigsAgentTabHighlightDefault = true;
+
         public const string ConfigsTelemetrySection = "telemetry";
         public const string ConfigsTelemetryUTCTimestampsKey = "utc_timestamps";
         public const bool ConfigsTelemetryUTCTimestampsDefault = true;
@@ -133,9 +168,31 @@ namespace pyRevitLabs.PyRevit {
         public const string EnvConfigsExtensionDBFileName = "PyRevitExtensionsDB.json";
         // extensions
         public const string DefaultExtensionRemoteName = PyRevitLabsConsts.DefaultRemoteName;
-        public const string DefaultExtensionRepoDefaultBranch = "master";
         public const string ExtensionsDefaultDirName = "Extensions";
         public const string ExtensionDisabledKey = "disabled";
+        /// <summary>
+        /// The only key a credential is stored under; its value is a DPAPI-sealed
+        /// blob, never the secret. Aliased from the protector so the key and the
+        /// format it holds cannot drift apart, and mirrored in
+        /// pyrevit.coreutils.credentials.
+        /// </summary>
+        public const string ExtensionCredentialKey = ExtensionCredentialProtector.ConfigKeyName;
+        public const string ExtensionPrivateRepoKey = "private_repo";
+        /// <summary>
+        /// Username the in-Revit updater authenticates a GitHub token with. GitHub
+        /// ignores it and only checks the token, but libgit2 needs a username to
+        /// build a credential pair at all.
+        /// </summary>
+        public const string ExtensionTokenDefaultUsername = "oauth2";
+        /// <summary>
+        /// Legacy plaintext credential keys, read only by the one-time migration in
+        /// pyrevit.versionmgr.upgrade and by RemoveLegacyCredentialKeys on a
+        /// re-persist. Aliased from the protector so a new legacy key cannot be
+        /// added here without the CLI clearing it too.
+        /// </summary>
+        public const string ExtensionUsernameKey = ExtensionCredentialProtector.LegacyUsernameKeyName;
+        public const string ExtensionPasswordKey = ExtensionCredentialProtector.LegacyPasswordKeyName;
+        public const string ExtensionTokenKey = ExtensionCredentialProtector.LegacyTokenKeyName;
         public const string ExtensionUIPostfix = ".extension";
         public const string ExtensionLibraryPostfix = ".lib";
         public const string ExtensionUIBinDirName = "bin";
@@ -170,24 +227,21 @@ namespace pyRevitLabs.PyRevit {
         public const string BundleScriptGrasshopperXPostfix = ".ghx";
         public const string BundleScriptRevitFamilyPostfix = ".rfa";
 
+        // loader settings
+        public const string ConfigsReadScriptMetadataKey = "read_script_metadata";
+        public const bool ConfigsReadScriptMetadataDefault = true;
+
         // theme
         public static SolidColorBrush PyRevitAccentBrush = new SolidColorBrush(Color.FromArgb(0xFF, 0xf3, 0x9c, 0x12));
         public static SolidColorBrush PyRevitBackgroundBrush = new SolidColorBrush(Color.FromArgb(0xFF, 0x2c, 0x3e, 0x50));
 
 
+        // install scope: machine install under Program Files or legacy all-users marker
+        public static bool IsInstallAllUsers() => PyRevitInstallScope.IsAllUsersInstall();
+
         // methods
         public static string FindConfigFileInDirectory(string sourcePath) {
-            var configMatcher = new Regex(ConfigsFileRegexPattern, RegexOptions.IgnoreCase);
-            // capture exceptions that might occur getting the files under sourcePath
-            // 
-            try {
-                if (CommonUtils.VerifyPath(sourcePath))
-                    foreach (string subFile in Directory.GetFiles(sourcePath))
-                        if (configMatcher.IsMatch(Path.GetFileName(subFile)))
-                            return subFile;
-            }
-            catch { }
-            return null;
+            return PyRevitInstallScope.FindConfigIniInDirectory(sourcePath);
         }
 
         // STANDARD PATHS ============================================================================================
@@ -196,15 +250,9 @@ namespace pyRevitLabs.PyRevit {
         public static string DefaultExtensionsPath =>
             Path.Combine(PyRevitLabsConsts.PyRevitPath, PyRevitConsts.ExtensionsDefaultDirName);
 
-        // pyRevit config file path
+        // pyRevit config file path (driven by install scope, not elevation)
         // @reviewed
-        public static string ConfigFilePath {
-            get {
-                string configRoot = UserEnv.IsRunAsElevated() ? PyRevitLabsConsts.PyRevitProgramDataPath : PyRevitLabsConsts.PyRevitPath;
-                var cfgFile = FindConfigFileInDirectory(configRoot);
-                return cfgFile != null ? cfgFile : Path.Combine(configRoot, DefaultConfigsFileName);
-            }
-        }
+        public static string ConfigFilePath => PyRevitInstallScope.GetActiveConfigFilePath();
 
         // pyRevit config file path
         // @reviewed

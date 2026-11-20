@@ -1,21 +1,24 @@
 """Utility functions to support forms module."""
 
-from pyrevit import framework
-from pyrevit.framework import wpf, Controls, Imaging
+from pyrevit.framework import Controls, Imaging, Uri, UriKind
+from . import _backend
 
 
 def bitmap_from_file(bitmap_file):
     """Create BitmapImage from a bitmap file.
 
     Args:
-        bitmap_file (str): path to bitmap file
+        bitmap_file (str): absolute path to bitmap file
 
     Returns:
         (BitmapImage): bitmap image object
     """
     bitmap = Imaging.BitmapImage()
     bitmap.BeginInit()
-    bitmap.UriSource = framework.Uri(bitmap_file)
+    success, uri = Uri.TryCreate(bitmap_file, UriKind.RelativeOrAbsolute)
+    if not success or uri is None:
+        raise ValueError("Failed to create Uri from file path: {}".format(bitmap_file))
+    bitmap.UriSource = uri
     bitmap.CacheOption = Imaging.BitmapCacheOption.OnLoad
     bitmap.CreateOptions = Imaging.BitmapCreateOptions.IgnoreImageCache
     bitmap.EndInit()
@@ -33,7 +36,7 @@ def load_component(xaml_file, comp_type):
     Returns:
         (System.Windows.Controls): loaded WPF control
     """
-    return wpf.LoadComponent(comp_type, xaml_file)
+    return _backend.load_component(comp_type, xaml_file)
 
 
 def load_ctrl_template(xaml_file):

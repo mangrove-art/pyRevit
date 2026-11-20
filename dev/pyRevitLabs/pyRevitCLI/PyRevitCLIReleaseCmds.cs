@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.IO;
@@ -43,7 +43,7 @@ namespace pyRevitCLI {
                 if (searchPattern != null)
                     releasesToList = PyRevitReleases.FindReleases(searchPattern, includePreRelease: listPreReleases);
                 else
-                    releasesToList = PyRevitReleases.GetReleases().Where(r => r.IsPyRevitRelease).ToList();
+                    releasesToList = PyRevitReleases.FilterPyRevitReleases(PyRevitReleases.GetReleases(), listPreReleases);
             }
 
             foreach (var prelease in releasesToList) {
@@ -77,7 +77,7 @@ namespace pyRevitCLI {
         }
 
         internal static void
-        DownloadReleaseAsset(GithubReleaseAssetType assetType, string destPath, string searchPattern, bool latest = false, bool listPreReleases = false) {
+        DownloadReleaseAsset(GithubReleaseAssetType assetType, string destPath, string searchPattern, bool latest = false, bool listPreReleases = false, bool admin = false) {
             // get dest path
             if (destPath is null)
                 destPath = UserEnv.GetPath(KnownFolder.Downloads);
@@ -94,7 +94,7 @@ namespace pyRevitCLI {
             // or find first release matching given pattern
             else {
                 if (searchPattern != null)
-                    matchedRelease = PyRevitReleases.FindReleases(searchPattern, includePreRelease: listPreReleases).First();
+                    matchedRelease = PyRevitReleases.FindReleases(searchPattern, includePreRelease: listPreReleases).FirstOrDefault();
 
                 if (matchedRelease is null)
                     throw new PyRevitException(
@@ -107,12 +107,11 @@ namespace pyRevitCLI {
             switch (assetType) {
                 case GithubReleaseAssetType.Archive: downloadUrl = matchedRelease.ArchiveURL; break;
                 case GithubReleaseAssetType.Installer:
-                    {
-                        var rawInstallerUrl = matchedRelease.InstallerURL;
-
-                        downloadUrl = rawInstallerUrl.Replace(".nupkg", "_signed.exe").Replace("_CLI_", "_").Replace("-cli.", "_").Replace("_admin_signed.exe", "_signed.exe");
-
-                    }
+                    downloadUrl = matchedRelease.GetInstallerURL(admin);
+                    if (downloadUrl is null)
+                        throw new PyRevitException(
+                            string.Format("Release \"{0}\" has no {1}installer asset.", matchedRelease.Tag, admin ? "admin " : string.Empty)
+                            );
                     break;
 
                 case GithubReleaseAssetType.Unknown: downloadUrl = null; break;

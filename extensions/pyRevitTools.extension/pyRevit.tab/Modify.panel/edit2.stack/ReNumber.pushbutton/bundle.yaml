@@ -1,12 +1,51 @@
 title:
-  ru: Перенумеровать
-  fr_fr: Renuméroter
-  en_us: Renumber
-  de_de: Umummerieren
+  en_us: Renumber ●
+  ko: 번호 다시 매기기 ●
+  fr_fr: Renuméroter ●
+  ru: Перенумеровать ●
+  chinese_s: 重新编号 ●
+  es_es: Renumerar ●
+  de_de: Umummerieren ●
+  pt_br: Renumerar ●
 tooltip:
-  ru: Перенумеровать пронумерованные элементы в порядке выделения.
-  fr_fr: Renuméroter les éléments dans l'ordre de sélection
-  en_us: ReNumber numbered elements in order of selection
-  de_de: Elemente werden mit der Reihenfolge der Auswahl neu nummeriert
-author: '{{author}}'
+  en_us: |-
+    Renumber numbered elements in the order you select them.
 
+    Shift-click:
+    Choose how duplicate numbers are handled: alert, skip, or sweep.
+  ko: |-
+    선택한 순서대로 번호가 지정된 요소의 번호를 다시 매깁니다.
+
+    Shift 키를 누르고 클릭:
+    중복 번호 처리 방법(알림, 건너뛰기 또는 연속 번호 매기기)을 선택합니다.
+  fr_fr: |-
+    Renumérote les éléments numérotés dans l'ordre de sélection.
+
+    Maj+clic :
+    Choisir le traitement des doublons : avertir, ignorer ou poursuivre la numérotation.
+  ru: |-
+    Перенумеровывает пронумерованные элементы в порядке выделения.
+
+    Shift + Щелчок:
+    Выбрать обработку дубликатов: предупреждать, пропускать или продолжать нумерацию.
+  chinese_s: |-
+    按选择顺序为已编号的图元重新编号。
+
+    按住 Shift 键单击：
+    选择重复编号的处理方式：警告、跳过或继续编号。
+  es_es: |-
+    Renumera los elementos numerados en el orden de selección.
+
+    Mayús-clic:
+    Elegir cómo tratar los números duplicados: avisar, omitir o continuar la numeración.
+  de_de: |-
+    Nummeriert Elemente in der Reihenfolge der Auswahl neu.
+
+    Bei gedrückter Umschalttaste klicken:
+    Festlegen, wie doppelte Nummern behandelt werden: warnen, überspringen oder fortlaufend nummerieren.
+  pt_br: |-
+    Renumera elementos numerados na ordem de seleção.
+
+    Clique mantendo a tecla Shift pressionada:
+    Escolher como lidar com números duplicados: alertar, ignorar ou continuar a numeração.
+author: '{{author}}'

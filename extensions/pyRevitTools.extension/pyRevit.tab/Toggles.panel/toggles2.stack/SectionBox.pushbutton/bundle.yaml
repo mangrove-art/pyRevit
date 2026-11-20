@@ -1,15 +1,52 @@
 title:
-  ru: Границы 3D вида
-  fr_fr: Zone de coupe
   en_us: Section Box
+  ko: 단면 상자
+  fr_fr: Zone de coupe
+  ru: Края 3D вида
+  chinese_s: 剖面框
+  es_es: Caja de sección
   de_de: 3D-Schnittbereich
+  pt_br: Caixa de Corte
 tooltip:
-  ru: Переключает видимость границы 3D вида в текущем 3D виде.
-  fr_fr: Bascule la visibilité de la zone de coupe dans la vue 3D actuelle
-  en_us: Toggles visibility of section box in current 3D view
-  de_de: >-
-    Dieses Werkzeug überschreibt in dieser Ansicht die Sichtbarkeit
-    des 3D-Schnittbereiches. Wenn man nochmals auf das Werkzeug klickt 
-    wird die Sichtbareit invertiert. Dies funktioniert nicht, wenn die
-    Kategorie 3D-Schnittbereiche in den Sichtbarkeit/Grafiken 
-    oder über Filter ausgeschalten wurde. 
+  en_us: |-
+    Toggle the section box behavior configured for the current 3D view.
+
+    Shift-click:
+    Choose whether the button controls section-box visibility, active state, or a temporary box around selected elements.
+  ko: |-
+    현재 3D 뷰에서 구성된 단면 상자 동작을 전환합니다. 활성 상태 모드에서는 비활성화할 때 현재 상자를 저장하고 다시 활성화할 때 복원합니다.
+
+    Shift 키를 누르고 클릭:
+    버튼이 단면 상자의 표시 여부, 활성 상태 또는 선택 요소 주변의 임시 상자를 제어할지 선택합니다.
+  fr_fr: |-
+    Bascule le comportement de la zone de coupe configuré pour la vue 3D actuelle. En mode actif, la zone actuelle est enregistrée à la désactivation et restaurée à la réactivation.
+
+    Maj+clic :
+    Choisir si le bouton contrôle la visibilité de la zone, son état actif ou une zone temporaire autour des éléments sélectionnés.
+  ru: |-
+    Переключает поведение секционной рамки, настроенное для текущего 3D-вида. В активном режиме рамка сохраняется при отключении и восстанавливается при повторном включении.
+
+    Shift + Щелчок:
+    Выбрать, управляет ли кнопка видимостью рамки, её активным состоянием или временной рамкой вокруг выбранных элементов.
+  chinese_s: |-
+    切换当前三维视图中配置的剖面框行为。处于活动状态模式时，禁用会保存当前框体，重新启用时会恢复。
+
+    按住 Shift 键单击：
+    选择按钮控制剖面框的可见性、活动状态，还是围绕所选图元创建临时框。
+  es_es: |-
+    Alterna el comportamiento configurado de la caja de sección en la vista 3D actual. En el modo activo, la caja actual se guarda al desactivarla y se restaura al volver a activarla.
+
+    Mayús-clic:
+    Elegir si el botón controla la visibilidad de la caja, su estado activo o una caja temporal alrededor de los elementos seleccionados.
+  de_de: |-
+    Schaltet das für die aktuelle 3D-Ansicht konfigurierte Verhalten der Schnittbox um. Im Aktivmodus wird die aktuelle Box beim Deaktivieren gespeichert und beim erneuten Aktivieren wiederhergestellt.
+
+    Bei gedrückter Umschalttaste klicken:
+    Auswählen, ob die Schaltfläche die Sichtbarkeit, den Aktivstatus oder eine temporäre Box um ausgewählte Elemente steuert.
+  pt_br: |-
+    Alterna o comportamento configurado da caixa de seção na vista 3D atual. No modo ativo, a caixa atual é salva ao ser desativada e restaurada ao ser reativada.
+
+    Clique mantendo a tecla Shift pressionada:
+    Escolher se o botão controla a visibilidade da caixa, seu estado ativo ou uma caixa temporária ao redor dos elementos selecionados.
+context:
+  - active-3d-view

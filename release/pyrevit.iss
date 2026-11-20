@@ -1,8 +1,9 @@
 #define MyAppName "pyRevit"
 #define MyAppUUID "f2a3da53-6f34-41d5-abbd-389ffa7f4d5f"
-#define MyAppVersion "5.1.0.25094"
+#define MyAppVersion "7.0.0.26278"
 #define MyAppPublisher "pyRevitLabs"
 #define MyAppURL "pyrevitlabs.io"
+#include "CodeDependencies.iss"
 
 [Setup]
 ; App information
@@ -13,14 +14,13 @@ AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
-AppCopyright=Copyright © 2014-2025 pyRevitLabs.io
+AppCopyright=Copyright © 2014-2026 pyRevitLabs.io
 LicenseFile=..\LICENSE.txt
 ; Installer
 DefaultGroupName={#MyAppName}
 DisableDirPage=auto
 DisableStartupPrompt=yes
 DisableProgramGroupPage=yes
-ArchitecturesInstallIn64BitMode=x64
 ChangesEnvironment=yes
 ;     path
 DefaultDirName={userappdata}\{#MyAppName}-Master
@@ -29,7 +29,7 @@ UsePreviousAppDir=yes
 PrivilegesRequired=lowest
 ; Build info
 OutputDir=..\dist
-; See dev/scripts/config.py INSTALLER_EXES
+; Keep this list aligned with the installer assets staged by build/.
 OutputBaseFilename=pyRevit_{#MyAppVersion}_signed
 SetupIconFile=..\bin\pyrevit.ico
 Compression=lzma
@@ -38,6 +38,7 @@ DisableWelcomePage=no
 WizardStyle=classic
 WizardImageFile=.\pyrevit.bmp
 WizardSmallImageFile=.\pyrevit-banner.bmp
+ArchitecturesInstallIn64BitMode=x64compatible
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -69,19 +70,115 @@ Source: "..\site-packages\*"; DestDir: "{app}\site-packages"; Flags: ignoreversi
 Source: "..\release\.pyrevitargs"; DestDir: "{app}"; Flags: ignoreversion; Components: core dev learn
 Source: "..\pyRevitfile"; DestDir: "{app}"; Flags: ignoreversion; Components: core dev learn
 
-[Registry]
-; Uninstaller does not undo this change
-; Multiple installs keep adding the path
-; https://stackoverflow.com/a/3431379/2350244
-; https://stackoverflow.com/a/9962307/2350244 (mod path module)
-Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}\bin"
-
 [Run]
-Filename: "{app}\bin\pyrevit.exe"; Description: "Clearning caches..."; Parameters: "caches clear --all"; Flags: runhidden
-Filename: "{app}\bin\pyrevit.exe"; Description: "Detach existing clones..."; Parameters: "detach --all"; Flags: runhidden
-Filename: "{app}\bin\pyrevit.exe"; Description: "Registering this clone..."; Parameters: "clones add this master --force"; Flags: runhidden
-Filename: "{app}\bin\pyrevit.exe"; Description: "Attaching this clone..."; Parameters: "attach master default --installed"; Flags: runhidden
+Filename: "{app}\bin\pyrevit.exe"; Description: "Clearing caches..."; Parameters: "caches clear --all"; Flags: runhidden; Check: not IsAdmin
+Filename: "{app}\bin\pyrevit.exe"; Description: "Detach existing clones..."; Parameters: "detach --all"; Flags: runhidden; Check: not IsAdmin
+Filename: "{app}\bin\pyrevit.exe"; Description: "Registering this clone..."; Parameters: "clones add this master --force"; Flags: runhidden; Check: not IsAdmin
+Filename: "{app}\bin\pyrevit.exe"; Description: "Attaching this clone..."; Parameters: "attach master default --installed"; Flags: runhidden; Check: not IsAdmin
+Filename: "{app}\bin\pyrevit.exe"; Description: "Seeding extension defaults..."; Parameters: "configs seedshippeddefaults"; Flags: runhidden; Check: not IsAdmin
 
 [UninstallRun]
 Filename: "{app}\bin\pyrevit.exe"; RunOnceId: "ClearCaches"; Parameters: "caches clear --all"; Flags: runhidden
 Filename: "{app}\bin\pyrevit.exe"; RunOnceId: "DetachClones"; Parameters: "detach --all"; Flags: runhidden
+Filename: "{app}\bin\pyrevit.exe"; RunOnceId: "RemoveMcpServers"; Parameters: "mcp uninstall --all --owned"; Flags: runhidden
+Filename: "{app}\bin\pyrevit.exe"; RunOnceId: "RemovePathEntry"; Parameters: "env path remove ""{app}\bin"" --scope=user"; Flags: runhidden
+
+[Code]
+function RunPyRevitCommand(const Params: String): Boolean;
+var
+  ResultCode: Integer;
+  PyRevitExe: String;
+begin
+  Result := False;
+  PyRevitExe := ExpandConstant('{app}\bin\pyrevit.exe');
+  if not FileExists(PyRevitExe) then
+  begin
+    Log('pyrevit.exe not found: ' + PyRevitExe);
+    Exit;
+  end;
+  Result := ExecAsOriginalUser(PyRevitExe, Params, ExpandConstant('{app}\bin'), SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  if not Result then
+    Log('Failed to execute pyrevit ' + Params)
+  else if ResultCode <> 0 then
+  begin
+    Log('pyrevit exited with code ' + IntToStr(ResultCode) + ': ' + Params);
+    Result := False;
+  end;
+end;
+
+procedure RunElevatedUserPostInstallCommands;
+begin
+  RunPyRevitCommand('caches clear --all');
+  RunPyRevitCommand('detach --all');
+  if not RunPyRevitCommand('clones add this master --force') then
+    Log('Elevated install: pyrevit clones add failed for original user');
+  if not RunPyRevitCommand('attach master default --installed') then
+    Log('Elevated install: pyrevit attach failed for original user');
+  if not RunPyRevitCommand('configs seedshippeddefaults') then
+    Log('Elevated install: pyrevit configs seedshippeddefaults failed for original user');
+end;
+
+function FindShadowingPyRevitExe: String;
+var
+  ResultCode: Integer;
+  Output: TExecOutput;
+  PyRevitExe: String;
+begin
+  Result := '';
+  PyRevitExe := ExpandConstant('{app}\bin\pyrevit.exe');
+  if not ExecAndCaptureOutput(PyRevitExe, 'env path which', ExpandConstant('{app}\bin'), SW_HIDE, ewWaitUntilTerminated, ResultCode, Output) then
+  begin
+    Log('Failed to execute pyrevit env path which');
+    Exit;
+  end;
+  if (ResultCode <> 0) or (GetArrayLength(Output.StdOut) = 0) then
+    Exit;
+  if CompareText(Trim(Output.StdOut[0]), PyRevitExe) <> 0 then
+    Result := Trim(Output.StdOut[0]);
+end;
+
+procedure WarnIfShadowedOnPath;
+var
+  ShadowingExe: String;
+begin
+  ShadowingExe := FindShadowingPyRevitExe;
+  if ShadowingExe = '' then
+    Exit;
+  Log('Another pyrevit.exe precedes this install on PATH: ' + ShadowingExe);
+  SuppressibleMsgBox(
+    'pyRevit was installed, but another pyrevit.exe comes earlier in the PATH environment variable. The "pyrevit" command keeps running that one:' + #13#10 +
+    '  ' + ShadowingExe + #13#10 + #13#10 +
+    'Update or uninstall that installation, or run this one by its full path:' + #13#10 +
+    '  ' + ExpandConstant('{app}\bin\pyrevit.exe'),
+    mbError, MB_OK, MB_OK);
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+  begin
+    if not RunPyRevitCommand('env path ensure "' + ExpandConstant('{app}\bin') + '" --scope=user --first') then
+      SuppressibleMsgBox(
+        'pyRevit was installed, but the installer could not register the install folder in your user PATH environment variable.' + #13#10 + #13#10 +
+        'You may need to manually add the following folder to your user PATH:' + #13#10 +
+        '  ' + ExpandConstant('{app}\bin'),
+        mbError, MB_OK, MB_OK)
+    else
+      WarnIfShadowedOnPath;
+    if IsAdmin then
+      RunElevatedUserPostInstallCommands;
+  end;
+end;
+
+function InitializeSetup: Boolean;
+begin
+  // WebView2 Runtime for the output window renderer
+  Dependency_AddWebView2;
+  // .NET 8 for Revit 2025-2026
+  Dependency_AddDotNet80;
+  Dependency_AddDotNet80Desktop;
+  // .NET 10 for Revit 2027+
+  Dependency_AddDotNet100;
+  Dependency_AddDotNet100Desktop;
+  Result := True;
+end;

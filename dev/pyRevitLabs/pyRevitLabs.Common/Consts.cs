@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.IO;
 using System.Collections.Generic;
 using System.Linq;
@@ -7,14 +7,19 @@ using System.Threading.Tasks;
 
 namespace pyRevitLabs.Common {
     public class PyRevitLabsConsts {
+        public const string PyRevitPathOverrideEnvVar = "PYREVIT_PATH_OVERRIDE";
+        public const string PyRevitProgramDataPathOverrideEnvVar = "PYREVIT_PROGRAMDATA_PATH_OVERRIDE";
+        public const string PyRevitAgentDirOverrideEnvVar = "PYREVIT_AGENT_DIR";
+        public const string PyRevitIgnoreLocalConfigEnvVar = "PYREVIT_IGNORE_LOCAL_CONFIG";
         // product
         public const string ProductName = "pyRevit";
 
         // urls
-        public const string RouterUrl = @".pyrevitlabs.io";
+        public const string RootDomain = @"pyrevitlabs.io";
+        public const string RouterUrl = @"." + RootDomain;
 
         public const string WikiUrl = "wiki" + RouterUrl;
-        public const string BlogsUrl = "blog" + RouterUrl;
+        public const string BlogsUrl = "https://" + RootDomain + "/posts/";
         public const string DocsUrl = "docs" + RouterUrl;
         public const string YoutubeUrl = "videos" + RouterUrl;
         public const string SupportUrl = "support" + RouterUrl;
@@ -34,6 +39,11 @@ namespace pyRevitLabs.Common {
         public const string TargetBranch = OriginalRepoDefaultBranch;
         //public const string TargetBranch = @"develop/newexec";
 
+        public static readonly string[] SupportedCiBinBranches = { "develop", "master" };
+
+        /// <summary>Branch used only for downloading pyrevit-hosts.json (develop has latest host data).</summary>
+        public const string HostsFileBranch = "develop";
+
         // consts for the official pyRevit repo
         public const string OriginalRepoName = ProductName;
         public static string OriginalRepoId = string.Format(@"pyrevitlabs/{0}", ProductName);
@@ -45,13 +55,45 @@ namespace pyRevitLabs.Common {
         public const string AppdataCacheDirName = "Cache";
         public const string AppdataLogsDirName = "Logs";
 
+        // install scope marker (all-users installer creates this under %ProgramData%\pyRevit\)
+        public const string InstallAllUsersMarkerFileName = "install_all_users";
+        public const string DefaultConfigsFileName = "pyRevit_config.ini";
+
         // pyRevit %appdata% path
         // @reviewed
-        public static string PyRevitPath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), AppdataDirName);
+        public static string PyRevitPath {
+            get {
+                string pathOverride = Environment.GetEnvironmentVariable(PyRevitPathOverrideEnvVar);
+                if (!string.IsNullOrWhiteSpace(pathOverride))
+                    return pathOverride;
+                return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), AppdataDirName);
+            }
+        }
+
+        /// <summary>
+        /// Folder holding agent instance records, run records and captures. Follows the pyRevit
+        /// appdata path unless <see cref="PyRevitAgentDirOverrideEnvVar"/> pins it, which lets a
+        /// session with its own appdata path keep registering where clients look for sessions.
+        /// </summary>
+        public static string AgentPath {
+            get {
+                string pathOverride = Environment.GetEnvironmentVariable(PyRevitAgentDirOverrideEnvVar);
+                if (!string.IsNullOrWhiteSpace(pathOverride))
+                    return pathOverride;
+                return Path.Combine(PyRevitPath, "agent");
+            }
+        }
 
         // pyRevit %programdata% path
         // @reviewed
-        public static string PyRevitProgramDataPath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), AppdataDirName);
+        public static string PyRevitProgramDataPath {
+            get {
+                string pathOverride = Environment.GetEnvironmentVariable(PyRevitProgramDataPathOverrideEnvVar);
+                if (!string.IsNullOrWhiteSpace(pathOverride))
+                    return pathOverride;
+                return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), AppdataDirName);
+            }
+        }
 
         // pyrevit general cache folder 
         public static string CacheDirectory => Path.Combine(PyRevitPath, AppdataCacheDirName);

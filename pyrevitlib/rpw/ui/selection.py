@@ -44,7 +44,7 @@ class Selection(BaseObjectWrapper, ElementSet):
 
     _revit_object_class = UI.Selection.Selection
 
-    def __init__(self, elements_or_ids=None, uidoc=revit.uidoc):
+    def __init__(self, elements_or_ids=None, uidoc=None):
         """
         Initializes Selection. Elements or ElementIds are optional.
         If no elements are provided on intiialization,
@@ -59,6 +59,7 @@ class Selection(BaseObjectWrapper, ElementSet):
 
         """
 
+        uidoc = uidoc or revit.uidoc
         BaseObjectWrapper.__init__(self, uidoc.Selection)
         self.uidoc = uidoc
 
@@ -295,6 +296,8 @@ class Pick(BaseObject):
 
 
 class SelectionFilter(UI.Selection.ISelectionFilter):
+    __namespace__ = "rpw.ui.selection"
+
     # http://www.revitapidocs.com/2017.1/d552f44b-221c-0ecd-d001-41a5099b2f9f.htm
     # Also See Ehsan's implementation on pyrevit
     # TODO: Implement ISelectFilter overload

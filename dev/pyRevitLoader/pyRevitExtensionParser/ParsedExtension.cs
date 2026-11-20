@@ -1,0 +1,588 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
+using static pyRevitExtensionParser.ExtensionParser;
+
+namespace pyRevitExtensionParser
+{
+    public class ParsedExtension : ParsedComponent
+    {
+        public new string Directory { get; set; }
+        public Dictionary<string, string> Titles { get; set; }
+        public Dictionary<string, string> Tooltips { get; set; }
+        public new string MinRevitVersion { get; set; }
+        public new string MaxRevitVersion { get; set; }
+        public ExtensionConfig Config { get; set; }
+
+        /// <summary>
+        /// Gets or sets whether this extension is compatible with rocket mode.
+        /// When rocket mode is enabled and the extension is compatible, the engine
+        /// will be reused between command executions for better performance.
+        /// </summary>
+        public bool RocketModeCompatible { get; set; } = false;
+
+        /// <summary>Normalized <see cref="DeclaredPythonEngine"/> value for a CPython declaration.</summary>
+        public const string CPythonEngineDeclaration = "cpython";
+
+        /// <summary>Normalized <see cref="DeclaredPythonEngine"/> value for an IronPython declaration.</summary>
+        public const string IronPythonEngineDeclaration = "ironpython";
+
+        /// <summary>
+        /// Engine <c>type</c> written into a script's engine configs when the extension's
+        /// CPython declaration applies.
+        /// </summary>
+        public const string CPythonEngineType = "CPython";
+
+        /// <summary>
+        /// Gets or sets the Python engine the extension declares in <c>extension.json</c>
+        /// (<see cref="CPythonEngineDeclaration"/> or <see cref="IronPythonEngineDeclaration"/>),
+        /// or null when it declares none.
+        /// </summary>
+        /// <remarks>
+        /// It is a default for Python scripts only. A bundle's own non-blank <c>engine.type</c>
+        /// takes precedence; without one, <c>cpython</c> selects CPython before the first-line
+        /// rule is consulted, while <c>ironpython</c> leaves the choice to each script's first
+        /// line. Event hooks ignore it and pick their engine from their own shebang;
+        /// smart-button <c>__selfinit__</c> always runs under IronPython.
+        /// </remarks>
+        public string DeclaredPythonEngine { get; set; }
+
+        /// <summary>
+        /// Whether the extension declares CPython as the default engine for its Python scripts.
+        /// </summary>
+        /// <remarks>
+        /// Invariant: a bundle's own non-blank <c>engine.type</c> takes precedence over this
+        /// declaration; only bundles without one run under <see cref="CPythonEngineType"/>.
+        /// </remarks>
+        public bool DeclaresCPython => DeclaredPythonEngine == CPythonEngineDeclaration;
+
+        /// <summary>
+        /// Layout directives that reference external components (from other extensions or native Revit).
+        /// These must be applied after the full UI is built using the Revit ribbon API.
+        /// </summary>
+        public List<ExternalLayoutDirective> ExternalLayoutDirectives { get; set; } = new List<ExternalLayoutDirective>();
+
+        /// <summary>
+        /// Gets or sets the list of users authorized to access this extension.
+        /// When populated, only users in this list can use the extension.
+        /// When null or empty, all users are allowed (unless AuthorizedGroups restricts access).
+        /// </summary>
+        public List<string> AuthorizedUsers { get; set; }
+
+        /// <summary>
+        /// Gets or sets the list of Windows security groups authorized to access this extension.
+        /// When populated, users must be a member of at least one of these groups to use the extension.
+        /// When null or empty, no group restriction is applied.
+        /// </summary>
+        public List<string> AuthorizedGroups { get; set; }
+
+        /// <summary>
+        /// True when the extension declares an access list that could not be read
+        /// (unparsable extension.json mentioning one, a non-list value, or a list with only
+        /// blank entries). The extension is then treated as restricted for everyone, so a
+        /// broken definition never widens access. Absent or empty lists leave this false.
+        /// </summary>
+        public bool AuthDefinitionUnreadable { get; set; }
+
+        // Cache directory existence checks to avoid repeated file system calls
+        private Dictionary<string, bool> _dirExistsCache = new Dictionary<string, bool>();
+
+        // Cache lib/bin paths per command to avoid repeated hierarchy traversal
+        private Dictionary<ParsedComponent, List<string>> _libPathsCache = new Dictionary<ParsedComponent, List<string>>();
+        private Dictionary<ParsedComponent, List<string>> _binPathsCache = new Dictionary<ParsedComponent, List<string>>();
+
+        // Cached helper to check directory existence with memoization
+        private bool DirExists(string path)
+        {
+            if (string.IsNullOrEmpty(path))
+                return false;
+
+            if (!_dirExistsCache.TryGetValue(path, out bool exists))
+            {
+                exists = System.IO.Directory.Exists(path);
+                _dirExistsCache[path] = exists;
+            }
+            return exists;
+        }
+
+        // Static HashSet for O(1) extension lookup - much faster than string comparisons
+        private static readonly HashSet<string> _scriptExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ".py", ".cs", ".vb", ".rb", ".dyn", ".gh", ".ghx", ".xaml", ".yaml", ".json", ".rfa"
+        };
+
+        // Cached hash value to avoid recalculation
+        private Dictionary<string, string> _cachedHashes = new Dictionary<string, string>();
+
+        private static readonly HashSet<string> _hashDirSuffixes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ".tab",
+            ".panel",
+            ".pulldown",
+            ".splitbutton",
+            ".splitpushbutton",
+            ".stack",
+            ".pushbutton",
+            ".smartbutton",
+            ".linkbutton",
+            ".nobutton",
+            ".urlbutton",
+            ".invokebutton",
+            ".panelbutton",
+            ".content",
+            ".combobox",
+            ".checkbox"
+        };
+
+        private static readonly HashSet<string> _hashDirNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "lib",
+            "hooks",
+            "checks"
+        };
+
+        /// <summary>
+        /// Calculates a hash from relevant bundle paths and modification times in the extension directory.
+        /// </summary>
+        /// <param name="seed">Optional seed to distinguish build strategies. Use 'Roslyn' for the Roslyn build strategy.</param>
+        public string GetHash(string seed = "")
+        {
+            // Check cache first
+            if (_cachedHashes.TryGetValue(seed, out var cachedHash))
+                return cachedHash;
+
+            if (string.IsNullOrEmpty(Directory) || !System.IO.Directory.Exists(Directory))
+                return Directory?.GetHashCode().ToString("X") ?? "0";
+
+            try
+            {
+                var hashEntries = new List<string>();
+                var extensionRootPath = Path.GetFullPath(Directory);
+
+                var pending = new Stack<(string path, bool isExtensionRoot)>();
+                var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                pending.Push((Directory, true));
+
+                while (pending.Count > 0)
+                {
+                    var pendingDirectory = pending.Pop();
+                    var currentDir = pendingDirectory.path;
+                    if (string.IsNullOrEmpty(currentDir))
+                        continue;
+
+                    string fullPath;
+                    try
+                    {
+                        fullPath = Path.GetFullPath(currentDir);
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+
+                    if (!visited.Add(fullPath))
+                        continue;
+
+                    DirectoryInfo dirInfo;
+                    try
+                    {
+                        dirInfo = new DirectoryInfo(fullPath);
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+
+                    if (!dirInfo.Exists)
+                        continue;
+
+                    try
+                    {
+                        var isLinkedDescendant = !pendingDirectory.isExtensionRoot
+                            && (dirInfo.Attributes & FileAttributes.ReparsePoint) != 0;
+                        if (isLinkedDescendant)
+                            continue;
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+
+                    var dirName = dirInfo.Name;
+                    var includeDir = pendingDirectory.isExtensionRoot || IsHashDirectory(dirName);
+
+                    if (includeDir)
+                    {
+                        var directoryPath = pendingDirectory.isExtensionRoot
+                            ? dirInfo.Name
+                            : GetHashRelativePath(extensionRootPath, fullPath);
+                        hashEntries.Add($"D:{directoryPath}:{dirInfo.LastWriteTimeUtc.Ticks}");
+
+                        try
+                        {
+                            foreach (var fileInfo in dirInfo.EnumerateFiles())
+                            {
+                                if (_scriptExtensions.Contains(fileInfo.Extension))
+                                {
+                                    var filePath = GetHashRelativePath(extensionRootPath, fileInfo.FullName);
+                                    hashEntries.Add($"F:{filePath}:{fileInfo.LastWriteTimeUtc.Ticks}");
+                                }
+                            }
+                        }
+                        catch
+                        {
+                            // Ignore file enumeration errors
+                        }
+                    }
+
+                    try
+                    {
+                        foreach (var subDir in dirInfo.EnumerateDirectories())
+                        {
+                            pending.Push((subDir.FullName, false));
+                        }
+                    }
+                    catch
+                    {
+                        // Ignore directory enumeration errors
+                    }
+                }
+
+                // Use MD5 hash like Python's get_str_hash()
+                // Include the seed in the hash to differentiate between build strategies
+                using (var md5 = MD5.Create())
+                {
+                    var inputString = string.Join("\n", hashEntries.OrderBy(x => x, StringComparer.OrdinalIgnoreCase)) + seed;
+                    var bytes = Encoding.UTF8.GetBytes(inputString);
+                    var hashBytes = md5.ComputeHash(bytes);
+                    var result = BitConverter.ToString(hashBytes).Replace("-", "").ToLowerInvariant();
+                    _cachedHashes[seed] = result;
+                    return result;
+                }
+            }
+            catch
+            {
+                // Fallback to simple hash if directory scanning fails
+                return Directory.GetHashCode().ToString("X");
+            }
+        }
+
+        /// <summary>Returns a path relative to an extension root without requiring newer .NET path APIs.</summary>
+        private static string GetHashRelativePath(string extensionRootPath, string fullPath)
+        {
+            var rootPrefix = extensionRootPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+                + Path.DirectorySeparatorChar;
+            return fullPath.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase)
+                ? fullPath.Substring(rootPrefix.Length)
+                : fullPath;
+        }
+
+        /// <summary>Determines whether a directory contributes to the extension cache hash.</summary>
+        private static bool IsHashDirectory(string dirName)
+        {
+            if (string.IsNullOrEmpty(dirName))
+                return false;
+
+            if (_hashDirNames.Contains(dirName))
+                return true;
+
+            var ext = Path.GetExtension(dirName);
+            return !string.IsNullOrEmpty(ext) && _hashDirSuffixes.Contains(ext);
+        }
+
+        // Cached startup script path to avoid repeated file system checks
+        private string _startupScript;
+        private bool _startupScriptInitialized;
+        private IReadOnlyList<string> _startupScripts;
+
+        /// <summary>
+        /// File name of the extension startup script that always runs under CPython.
+        /// </summary>
+        public const string CPythonStartupFileName = "startup.cpython.py";
+
+        /// <summary>
+        /// Gets the path to the startup script if it exists
+        /// </summary>
+        public string StartupScript
+        {
+            get
+            {
+                if (!_startupScriptInitialized)
+                {
+                    _startupScript = FindStartupScript();
+                    _startupScriptInitialized = true;
+                }
+                return _startupScript;
+            }
+        }
+
+        /// <summary>
+        /// Gets every startup script in execution order: <see cref="StartupScript"/>, then
+        /// <c>startup.cpython.py</c>, which runs under CPython alongside or instead of it.
+        /// </summary>
+        /// <remarks>
+        /// An extension may ship only <c>startup.cpython.py</c>, so callers must check this
+        /// list rather than <see cref="StartupScript"/> to decide whether startup work exists.
+        /// </remarks>
+        public IReadOnlyList<string> StartupScripts
+        {
+            get
+            {
+                if (_startupScripts == null)
+                    _startupScripts = FindStartupScripts();
+                return _startupScripts;
+            }
+        }
+
+        // Use HashSet for O(1) type lookup instead of Contains on array
+        private static readonly HashSet<CommandComponentType> _allowedTypes = new HashSet<CommandComponentType>
+        {
+            CommandComponentType.PushButton,
+            CommandComponentType.PanelButton,
+            CommandComponentType.SmartButton,
+            CommandComponentType.NoButton,
+            CommandComponentType.UrlButton,
+            CommandComponentType.InvokeButton,
+            CommandComponentType.ContentButton
+        };
+
+        // Cached command components - this is called 3+ times per extension during loading
+        private List<ParsedComponent> _cachedCommandComponents;
+
+        /// <summary>
+        /// Collects all command components from this extension (cached after first call).
+        /// Builds control IDs for each component based on hierarchy.
+        /// </summary>
+        public IEnumerable<ParsedComponent> CollectCommandComponents()
+        {
+            if (_cachedCommandComponents == null)
+            {
+                _cachedCommandComponents = new List<ParsedComponent>();
+                // Start with no parent control ID - tabs will be the first level
+                CollectInto(_cachedCommandComponents, this.Children, null);
+            }
+            return _cachedCommandComponents;
+        }
+
+        // Non-allocating collection method - adds directly to list instead of yielding
+        // parentControlId tracks the control ID hierarchy for building correct IDs
+        private void CollectInto(List<ParsedComponent> result, IEnumerable<ParsedComponent> list, string parentControlId)
+        {
+            if (list == null) return;
+
+            foreach (var comp in list)
+            {
+                // Build control ID for this component
+                // Format matches Python: 
+                // - For tabs (no parent): "CustomCtrl_%CustomCtrl_%{name}"
+                // - For other components: "{parentId}%{name}"
+                // - For groups inside groups (like pulldowns inside panels): need special handling
+                // IMPORTANT: Use DisplayName (original folder name with spaces) for control IDs,
+                // NOT Name (which has spaces stripped). Revit uses the actual folder names.
+                string displayName = comp.DisplayName ?? comp.Name;
+
+                string currentControlId;
+                if (string.IsNullOrEmpty(parentControlId))
+                {
+                    // Top-level (tab): "CustomCtrl_%CustomCtrl_%{name}"
+                    currentControlId = $"CustomCtrl_%CustomCtrl_%{displayName}";
+                }
+                else if (comp.Type == CommandComponentType.Stack)
+                {
+                    currentControlId = parentControlId;
+                }
+                else if (comp.Type == CommandComponentType.PullDown ||
+                         comp.Type == CommandComponentType.SplitButton ||
+                         comp.Type == CommandComponentType.SplitPushButton)
+                {
+                    // Command groups inside containers need to deepen the hierarchy
+                    // This matches Python's GenericUICommandGroup.control_id behavior
+                    var deepenedParent = parentControlId.Replace("_%CustomCtrl", "_%CustomCtrl_%CustomCtrl");
+                    currentControlId = $"{deepenedParent}%{displayName}";
+                }
+                else
+                {
+                    // Normal child: append to parent
+                    currentControlId = $"{parentControlId}%{displayName}";
+                }
+
+                // Set the control ID on the component
+                comp.ControlId = currentControlId;
+
+                if (comp.Children != null)
+                {
+                    CollectInto(result, comp.Children, currentControlId);
+                }
+
+                // HashSet.Contains is O(1) vs array Contains which is O(n)
+                if (_allowedTypes.Contains(comp.Type))
+                    result.Add(comp);
+            }
+        }
+
+        /// <summary>
+        /// Returns the <c>lib</c> folders a command imports from: the extension's, then those of the
+        /// command's ancestors from the tab inwards, then the command's own. Missing folders are skipped.
+        /// </summary>
+        /// <remarks>
+        /// Invariant: only the extension and the components on the path from the extension down to
+        /// <paramref name="command"/> contribute a folder. The <c>lib</c> of a sibling bundle, or of any
+        /// other component off that path, would shadow the command's own modules of the same name.
+        /// Note: these paths are compiled into the command assemblies, so changing what this returns for
+        /// an unchanged extension needs a new <c>CommandTypeGeneratorSchema</c> in
+        /// <c>AssemblyBuilderService</c>, or cached assemblies keep the old paths.
+        /// </remarks>
+        public List<string> CollectLibraryPaths(ParsedComponent command)
+        {
+            if (_libPathsCache.TryGetValue(command, out var cached))
+                return cached;
+
+            var libPaths = CollectAncestorFolders(command, "lib");
+            _libPathsCache[command] = libPaths;
+            return libPaths;
+        }
+
+        /// <summary>
+        /// Returns the folders searched for a command's assemblies (invoke targets, bundle modules): the
+        /// <c>bin</c> folders of the extension, of the command's ancestors from the tab inwards and of the
+        /// command, then the command's own folder. Missing <c>bin</c> folders are skipped.
+        /// </summary>
+        /// <remarks>
+        /// Invariant: as in <see cref="CollectLibraryPaths"/>, no component off the path from the extension
+        /// down to <paramref name="command"/> contributes a folder.
+        /// </remarks>
+        public List<string> CollectBinaryPaths(ParsedComponent command)
+        {
+            if (_binPathsCache.TryGetValue(command, out var cached))
+                return cached;
+
+            var binPaths = CollectAncestorFolders(command, "bin");
+            if (!string.IsNullOrEmpty(command.Directory) && !binPaths.Contains(command.Directory))
+                binPaths.Add(command.Directory);
+
+            _binPathsCache[command] = binPaths;
+            return binPaths;
+        }
+
+        private List<string> CollectAncestorFolders(ParsedComponent command, string folderName)
+        {
+            var folders = new List<string>();
+            AddExistingFolder(folders, this.Directory, folderName);
+            foreach (var component in GetAncestorChain(command))
+                AddExistingFolder(folders, component.Directory, folderName);
+
+            return folders;
+        }
+
+        private void AddExistingFolder(List<string> folders, string parentDirectory, string folderName)
+        {
+            if (string.IsNullOrEmpty(parentDirectory))
+                return;
+
+            var folder = Path.Combine(parentDirectory, folderName);
+            if (DirExists(folder) && !folders.Contains(folder))
+                folders.Add(folder);
+        }
+
+        /// <summary>
+        /// Returns the components from the tab down to <paramref name="target"/>, both included, or only
+        /// <paramref name="target"/> when it is not part of this extension's tree.
+        /// </summary>
+        private List<ParsedComponent> GetAncestorChain(ParsedComponent target)
+        {
+            var chain = new List<ParsedComponent>();
+            if (!AppendChainTo(this.Children, target, chain))
+                chain.Add(target);
+
+            return chain;
+        }
+
+        private static bool AppendChainTo(IEnumerable<ParsedComponent> siblings, ParsedComponent target, List<ParsedComponent> chain)
+        {
+            if (siblings == null)
+                return false;
+
+            foreach (var comp in siblings)
+            {
+                chain.Add(comp);
+                if (comp == target || AppendChainTo(comp.Children, target, chain))
+                    return true;
+
+                chain.RemoveAt(chain.Count - 1);
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Finds a module DLL by searching binary paths.
+        /// Mimics the pythonic loader's find_bundle_module() function.
+        /// </summary>
+        public string FindModuleDll(string moduleName, ParsedComponent command)
+        {
+            // If moduleName is already a full path and exists, return it
+            if (Path.IsPathRooted(moduleName) && File.Exists(moduleName))
+                return moduleName;
+
+            // Get all binary paths for this command
+            var binaryPaths = CollectBinaryPaths(command);
+
+            // Search for the module in each binary path
+            foreach (var binPath in binaryPaths)
+            {
+                var possibleModulePath = Path.Combine(binPath, moduleName);
+                if (File.Exists(possibleModulePath))
+                    return possibleModulePath;
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Finds the startup script in the extension directory
+        /// Checks for startup files in order: .py, .cs, .vb, .rb
+        /// </summary>
+        /// <returns>Full path to the startup script or null if not found</returns>
+        private string FindStartupScript()
+        {
+            if (string.IsNullOrEmpty(Directory) || !System.IO.Directory.Exists(Directory))
+                return null;
+
+            // Check for startup scripts in order of preference
+            var startupFiles = new[]
+            {
+                "startup.py",   // Python
+                "startup.cs",   // C#
+                "startup.vb",   // VB.NET
+                "startup.rb"    // Ruby
+            };
+
+            foreach (var fileName in startupFiles)
+            {
+                var fullPath = Path.Combine(Directory, fileName);
+                if (File.Exists(fullPath))
+                    return fullPath;
+            }
+
+            return null;
+        }
+
+        private IReadOnlyList<string> FindStartupScripts()
+        {
+            var scripts = new List<string>();
+            if (StartupScript != null)
+                scripts.Add(StartupScript);
+            if (!string.IsNullOrEmpty(Directory))
+            {
+                var cpythonStartupScript = Path.Combine(Directory, CPythonStartupFileName);
+                if (File.Exists(cpythonStartupScript))
+                    scripts.Add(cpythonStartupScript);
+            }
+            return scripts;
+        }
+
+    }
+}

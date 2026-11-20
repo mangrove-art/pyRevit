@@ -1,14 +1,52 @@
 title:
-  ru: Создать рабочий набор для связанного элемента
-  fr_fr: Créer un sous-projet pour les fichiers liés
   en_us: Create Workset For Linked Element
+  ko: 링크된 요소의 워크셋 생성
+  fr_fr: Créer un sous-projet pour les fichiers liés
+  ru: Создать рабочий набор для связанного элемента
+  chinese_s: 为链接图元创建工作集
+  es_es: Crear área de trabajo para elemento vinculado
   de_de: Erstelle Bearbeitungsbereich für verlinktes Element
+  pt_br: Criar Workset para Elemento Vinculado
 tooltip:
-  ru: Данный инструмент создаст рабочий набор для выделенного связанного элемента на основе его имени. Если модель не является совместной, она будет преобразована в модель для совмесного использования.
-  fr_fr: Cet outil créera un sous-projet pour le fichier lié sélectionné en fonction de son nom. Si le modèle n'est pas partagé, il sera converti en modèle partagé
-  en_us: This tool will create a workset for the selected linked element base on its name. If the model is not workshared, it will be converted to workshared model
-  de_de: >-
-    Dieses Werkzeug erstellt ein Bearbeitungsbereich für das 
-    ausgewählte verknüpfte Element auf der Grundlage seines Namens. 
-    Wenn das Modell keine Arbeitsteilung verwendet, 
-    wird es in ein Modell mir Arbeitsteilung umgewandelt. 
+  en_us: |-
+    Create a workset for the selected linked element based on its name. The model is made workshared if necessary.
+
+    Shift-click:
+    Configure whether to include all elements, assign worksets to element types, and use custom prefixes.
+  ko: |-
+    선택한 링크 요소의 이름을 기반으로 작업 세트를 만듭니다. 필요한 경우 모델을 작업 공유 모델로 변환합니다.
+
+    Shift 키를 누르고 클릭:
+    모든 요소 포함, 요소 유형에 작업 세트 지정, 사용자 지정 접두사 사용 여부를 설정합니다.
+  fr_fr: |-
+    Crée un sous-projet pour l'élément lié sélectionné à partir de son nom. Le modèle est converti en modèle partagé si nécessaire.
+
+    Maj+clic :
+    Configurer l'inclusion de tous les éléments, l'affectation de sous-projets aux types d'éléments et l'utilisation de préfixes personnalisés.
+  ru: |-
+    Создаёт рабочий набор для выбранного связанного элемента на основе его имени. При необходимости модель становится совместной.
+
+    Shift + Щелчок:
+    Настроить обработку всех элементов, назначение рабочих наборов типам элементов и использование собственных префиксов.
+  chinese_s: |-
+    根据所选链接图元的名称创建工作集。必要时将模型转换为工作共享模型。
+
+    按住 Shift 键单击：
+    配置是否包含所有图元、为图元类型指定工作集以及使用自定义前缀。
+  es_es: |-
+    Crea un área de trabajo para el elemento vinculado seleccionado basándose en su nombre. Si es necesario, convierte el modelo en un modelo compartido.
+
+    Mayús-clic:
+    Configurar si se incluyen todos los elementos, se asignan áreas de trabajo a los tipos de elemento y se usan prefijos personalizados.
+  de_de: |-
+    Erstellt anhand des Namens einen Arbeitsbereich für das ausgewählte verknüpfte Element. Bei Bedarf wird das Modell in ein workshared-Modell umgewandelt.
+
+    Bei gedrückter Umschalttaste klicken:
+    Festlegen, ob alle Elemente einbezogen, Arbeitsbereiche Elementtypen zugewiesen und benutzerdefinierte Präfixe verwendet werden.
+  pt_br: |-
+    Cria um workset para o elemento vinculado selecionado com base no nome. Se necessário, converte o modelo em um modelo com compartilhamento de trabalho.
+
+    Clique mantendo a tecla Shift pressionada:
+    Configurar se todos os elementos serão incluídos, se worksets serão atribuídos aos tipos de elemento e se prefixos personalizados serão usados.
+context:
+  - doc-project

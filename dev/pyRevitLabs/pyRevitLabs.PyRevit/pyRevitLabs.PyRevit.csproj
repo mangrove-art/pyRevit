@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <UseWpf>true</UseWpf>
     <UseWindowsForms>true</UseWindowsForms>
@@ -6,7 +6,12 @@
     <Platforms>x64</Platforms>
     <TargetFrameworks>net48;net8.0-windows</TargetFrameworks>
   </PropertyGroup>
-  
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="pyRevitCLI.Tests" />
+    <InternalsVisibleTo Include="pyRevitLabs.UnitTests" />
+  </ItemGroup>
+
   <ItemGroup>
     <Reference Condition="'$(TargetFrameworkIdentifier)' == '.NETFramework'" Include="Microsoft.CSharp"/>
     <Reference Include="pyRevitLabs.Json" HintPath="$(PyRevitDevLibsDir)\pyRevitLabs.Json.dll" Private="false" />
@@ -16,19 +21,19 @@
 
   <ItemGroup>
     <PackageReference Include="Nett" Version="0.15.0" />
-    <PackageReference Include="LibGit2Sharp" Version="0.30.0" />
-
-    <PackageReference Condition="'$(TargetFrameworkIdentifier)' == '.NETFramework'" Include="MadMilkman.Ini" Version="1.0.6" />
-    <PackageReference Condition="'$(TargetFrameworkIdentifier)' == '.NetCoreApp'" Include="MadMilkman.Ini.Unofficial" Version="1.0.1" />
+    <PackageReference Include="LibGit2Sharp" Version="0.32.0" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\pyRevitLabs.Common\pyRevitLabs.Common.csproj" />
     <ProjectReference Include="..\pyRevitLabs.CommonWPF\pyRevitLabs.CommonWPF.csproj" />
+    <ProjectReference Include="..\pyRevitLabs.Configurations.Ini\pyRevitLabs.Configurations.Ini.csproj" />
+    <ProjectReference Include="..\pyRevitLabs.Configurations\pyRevitLabs.Configurations.csproj" />
     <ProjectReference Include="..\pyRevitLabs.TargetApps.Revit\pyRevitLabs.TargetApps.Revit.csproj" />
   </ItemGroup>
 
-  <Target Name="DeployDependencies" AfterTargets="Deploy">
+  <Target Name="DeployDependencies" AfterTargets="Deploy" Condition="'$(SkipPyRevitDeploy)' != 'true'">
     <Copy SourceFiles="$(OutDir)\Nett.dll" DestinationFolder="$(PyRevitBinDir)" />
+    <Copy SourceFiles="$(OutDir)\INIFileParser.dll" DestinationFolder="$(PyRevitBinDir)" Condition="Exists('$(OutDir)\INIFileParser.dll')" />
   </Target>
 </Project>

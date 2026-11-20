@@ -2,7 +2,7 @@
 
 Modify the behavior of Lists in Python-Markdown to act in a sane manor.
 
-See <https://pythonhosted.org/Markdown/extensions/sane_lists.html>
+See <https://python-markdown.github.io/extensions/sane_lists/>
 for documentation.
 
 Original code Copyright 2011 [Waylan Limberg](http://achinghead.com)
@@ -22,23 +22,25 @@ import re
 class SaneOListProcessor(OListProcessor):
     """Sane ordered list processor."""
 
-    SIBLING_TAGS = ['ol']
+    SIBLING_TAGS = ["ol"]
 
     def __init__(self, parser):
         super(SaneOListProcessor, self).__init__(parser)
-        self.CHILD_RE = re.compile(r'^[ ]{0,%d}((\d+\.))[ ]+(.*)' %
-                                   (self.tab_length - 1))
+        self.CHILD_RE = re.compile(
+            r"^[ ]{0,%d}((\d+\.))[ ]+(.*)" % (self.tab_length - 1)
+        )
 
 
 class SaneUListProcessor(UListProcessor):
     """Sane unordered list processor."""
 
-    SIBLING_TAGS = ['ul']
+    SIBLING_TAGS = ["ul"]
 
     def __init__(self, parser):
         super(SaneUListProcessor, self).__init__(parser)
-        self.CHILD_RE = re.compile(r'^[ ]{0,%d}(([*+-]))[ ]+(.*)' %
-                                   (self.tab_length - 1))
+        self.CHILD_RE = re.compile(
+            r"^[ ]{0,%d}(([*+-]))[ ]+(.*)" % (self.tab_length - 1)
+        )
 
 
 class SaneListExtension(Extension):
@@ -46,8 +48,8 @@ class SaneListExtension(Extension):
 
     def extendMarkdown(self, md, md_globals):
         """Override existing Processors."""
-        md.parser.blockprocessors['olist'] = SaneOListProcessor(md.parser)
-        md.parser.blockprocessors['ulist'] = SaneUListProcessor(md.parser)
+        md.parser.blockprocessors["olist"] = SaneOListProcessor(md.parser)
+        md.parser.blockprocessors["ulist"] = SaneUListProcessor(md.parser)
 
 
 def makeExtension(*args, **kwargs):

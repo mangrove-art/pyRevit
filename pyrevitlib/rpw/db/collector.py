@@ -25,14 +25,13 @@ Note:
     | ``Custom`` = where
 
 """
-
 from rpw import revit, DB
-from rpw.utils.dotnet import List
+import pyrevit_automation as automation
+from rpw.utils.dotnet import to_clr_list
 from rpw.base import BaseObjectWrapper, BaseObject
 from rpw.exceptions import RpwException, RpwTypeError, RpwCoerceError
 from rpw.db.element import Element
 from rpw.db.builtins import BicEnum, BipEnum
-from rpw.ui.selection import Selection
 from rpw.db.collection import ElementSet
 from rpw.utils.coerce import to_element_id, to_element_ids
 from rpw.utils.coerce import to_category, to_class
@@ -300,7 +299,7 @@ class FilterClasses():
                 wrapped_element = Element(element)
                 if not func(wrapped_element):
                     excluded_elements.add(element.Id)
-            excluded_elements = List[DB.ElementId](excluded_elements)
+            excluded_elements = to_clr_list(DB.ElementId, excluded_elements)
             if excluded_elements:
                 return collector.Excluding(excluded_elements)
             else:
@@ -337,6 +336,10 @@ class FilterClasses():
             return collector.UnionWith(new_collector)
 
 
+@automation.type(
+    "rpw.types.collector",
+    PlainEnglish="Build a filtered Revit element collection and retrieve its results.",
+)
 class Collector(BaseObjectWrapper):
     """
     Revit FilteredElement Collector Wrapper
@@ -429,10 +432,14 @@ class Collector(BaseObjectWrapper):
         elif 'elements' in filters:
             elements = filters.pop('elements')
             element_ids = to_element_ids(elements)
-            collector = DB.FilteredElementCollector(collector_doc, List[DB.ElementId](element_ids))
+            collector = DB.FilteredElementCollector(
+                collector_doc, to_clr_list(DB.ElementId, element_ids)
+            )
         elif 'element_ids' in filters:
             element_ids = filters.pop('element_ids')
-            collector = DB.FilteredElementCollector(collector_doc, List[DB.ElementId](element_ids))
+            collector = DB.FilteredElementCollector(
+                collector_doc, to_clr_list(DB.ElementId, element_ids)
+            )
         else:
             collector = DB.FilteredElementCollector(collector_doc)
 
@@ -471,6 +478,11 @@ class Collector(BaseObjectWrapper):
         for element in self._collector:
             yield element
 
+    @automation.operation(
+        "rpw.collector.get-elements",
+        PlainEnglish="Read all elements matching an rpw collector's filters.",
+        effects=("model.read",),
+    )
     def get_elements(self, wrapped=True):
         """
         Returns list with all elements instantiated using :any:`Element`
@@ -496,8 +508,14 @@ class Collector(BaseObjectWrapper):
 
     def select(self):
         """ Selects Collector Elements on the UI """
+        from rpw.ui.selection import Selection
         Selection(self.element_ids)
 
+    @automation.operation(
+        "rpw.collector.get-first",
+        PlainEnglish="Read the first element matching an rpw collector's filters.",
+        effects=("model.read",),
+    )
     def get_first(self, wrapped=True):
         """
         Returns first element or `None`
@@ -517,6 +535,11 @@ class Collector(BaseObjectWrapper):
     #     deprecate_warning('Collector.first', 'Collector.get_first()')
     #     return self.get_first(wrapped=False)
 
+    @automation.operation(
+        "rpw.collector.get-element-ids",
+        PlainEnglish="Read identifiers for all elements matching an rpw collector's filters.",
+        effects=("model.read",),
+    )
     def get_element_ids(self):
         """
         Returns list with all elements instantiated using :any:`Element`
@@ -627,7 +650,7 @@ class ParameterFilter(BaseObjectWrapper):
                 raise RpwException('Rule not valid: {}'.format(condition))
 
         rules = []
-        for condition_name, condition_value in conditions.iteritems():
+        for condition_name, condition_value in conditions.items():
 
             # Returns on of the CreateRule factory method names above
             rule_factory_name = ParameterFilter.RULES.get(condition_name)
@@ -657,8 +680,9 @@ class ParameterFilter(BaseObjectWrapper):
         if not rules:
             raise RpwException('malformed filter rule: {}'.format(conditions))
 
-        _revit_object = DB.ElementParameterFilter(List[DB.FilterRule](rules),
-                                                  reverse)
+        _revit_object = DB.ElementParameterFilter(
+            to_clr_list(DB.FilterRule, rules), reverse
+        )
         super(ParameterFilter, self).__init__(_revit_object)
         self.conditions = conditions
 
@@ -686,3 +710,4 @@ class ParameterFilter(BaseObjectWrapper):
 
     def __repr__(self):
         return super(ParameterFilter, self).__repr__(data=self.conditions)
+

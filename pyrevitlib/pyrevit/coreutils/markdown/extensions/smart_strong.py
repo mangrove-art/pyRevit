@@ -2,7 +2,7 @@
 
 This extention adds smarter handling of double underscores within words.
 
-See <https://pythonhosted.org/Markdown/extensions/smart_strong.html>
+See <https://github.com/Python-Markdown/markdown/blob/2.6.8-final/docs/extensions/smart_strong.txt>
 for documentation.
 
 Original code Copyright 2011 [Waylan Limberg](http://achinghead.com)
@@ -17,8 +17,8 @@ from __future__ import unicode_literals
 from . import Extension
 from ..inlinepatterns import SimpleTagPattern
 
-SMART_STRONG_RE = r'(?<!\w)(_{2})(?!_)(.+?)(?<!_)\2(?!\w)'
-STRONG_RE = r'(\*{2})(.+?)\2'
+SMART_STRONG_RE = r"(?<!\w)(_{2})(?!_)(.+?)(?<!_)\2(?!\w)"
+STRONG_RE = r"(\*{2})(.+?)\2"
 
 
 class SmartEmphasisExtension(Extension):
@@ -26,11 +26,9 @@ class SmartEmphasisExtension(Extension):
 
     def extendMarkdown(self, md, md_globals):
         """Modify inline patterns."""
-        md.inlinePatterns['strong'] = SimpleTagPattern(STRONG_RE, 'strong')
+        md.inlinePatterns["strong"] = SimpleTagPattern(STRONG_RE, "strong")
         md.inlinePatterns.add(
-            'strong2',
-            SimpleTagPattern(SMART_STRONG_RE, 'strong'),
-            '>emphasis2'
+            "strong2", SimpleTagPattern(SMART_STRONG_RE, "strong"), ">emphasis2"
         )
 
 

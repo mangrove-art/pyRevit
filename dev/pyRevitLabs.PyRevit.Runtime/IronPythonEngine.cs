@@ -5,6 +5,7 @@ using System.Collections.Generic;
 // iron languages
 using Microsoft.Scripting;
 using Microsoft.Scripting.Hosting;
+using Microsoft.Scripting.Runtime;
 using IronPython.Hosting;
 using IronPython.Compiler;
 using IronPython.Runtime.Exceptions;
@@ -37,6 +38,16 @@ namespace PyRevitLabs.PyRevit.Runtime {
             }
         }
 
+        public static Tuple<Stream, System.Text.Encoding> DefaultErrorStreamConfig {
+            get {
+                return (Tuple<Stream, System.Text.Encoding>)AppDomain.CurrentDomain.GetData(DomainStorageKeys.IronPythonEngineDefaultErrorStreamCfgKey);
+            }
+
+            set {
+                AppDomain.CurrentDomain.SetData(DomainStorageKeys.IronPythonEngineDefaultErrorStreamCfgKey, value);
+            }
+        }
+
         public static Tuple<Stream, System.Text.Encoding> DefaultInputStreamConfig {
             get {
                 return (Tuple<Stream, System.Text.Encoding>)AppDomain.CurrentDomain.GetData(DomainStorageKeys.IronPythonEngineDefaultInputStreamCfgKey);
@@ -50,10 +61,7 @@ namespace PyRevitLabs.PyRevit.Runtime {
         public override void Init(ref ScriptRuntime runtime) {
             base.Init(ref runtime);
 
-            // extract engine configuration from runtime data
-            try {
-                ExecEngineConfigs = JsonConvert.DeserializeObject<IronPythonEngineConfigs>(runtime.ScriptRuntimeConfigs.EngineConfigs);
-            } catch {}
+            LoadExecutionConfigs(ref runtime);
 
             // If the command required a fullframe engine
             // or if the command required a clean engine
@@ -62,11 +70,19 @@ namespace PyRevitLabs.PyRevit.Runtime {
         }
 
         public override void Start(ref ScriptRuntime runtime) {
+            LoadExecutionConfigs(ref runtime);
+
             if (!RecoveredFromCache) {
                 var flags = new Dictionary<string, object>();
 
                 // default flags
                 flags["LightweightScopes"] = true;
+
+                // Bound recursion so a runaway circular import raises a catchable
+                // RecursionError instead of overflowing the native stack and crashing
+                // Revit. IronPython does not enforce a limit unless one is set.
+                flags["RecursionLimit"] = 1000;
+                flags["ConsoleSupportLevel"] = SharedIO.SupportLevel.Basic;
 
                 if (ExecEngineConfigs.full_frame) {
                     flags["Frames"] = true;
@@ -74,7 +90,8 @@ namespace PyRevitLabs.PyRevit.Runtime {
                     flags["Tracing"] = true;
                 }
 
-                Engine = IronPython.Hosting.Python.CreateEngine(flags);
+                Engine = CreateEngineWithUtf8Streams(flags);
+                IronPythonRuleCaches.Track(Engine);
 
                 // also, allow access to the PyRevitLoader internals
                 Engine.Runtime.LoadAssembly(typeof(PyRevitLoader.ScriptExecutor).Assembly);
@@ -88,6 +105,7 @@ namespace PyRevitLabs.PyRevit.Runtime {
 
                 // save the default stream for later resetting the streams
                 DefaultOutputStreamConfig = new Tuple<Stream, System.Text.Encoding>(Engine.Runtime.IO.OutputStream, Engine.Runtime.IO.OutputEncoding);
+                DefaultErrorStreamConfig = new Tuple<Stream, System.Text.Encoding>(Engine.Runtime.IO.ErrorStream, Engine.Runtime.IO.ErrorEncoding);
                 DefaultInputStreamConfig = new Tuple<Stream, System.Text.Encoding>(Engine.Runtime.IO.InputStream, Engine.Runtime.IO.InputEncoding);
 
                 // setup stdlib
@@ -103,6 +121,9 @@ namespace PyRevitLabs.PyRevit.Runtime {
         public override int Execute(ref ScriptRuntime runtime) {
             // Setup the command scope in this engine with proper builtin and scope parameters
             var scope = Engine.CreateScope();
+            foreach (var variable in ScriptBuiltins.CreateRuntimeVariables(
+                runtime, RecoveredFromCache, TypeId))
+                scope.SetVariable(variable.Key, variable.Value);
 
             // Create the script from source file
             var script = Engine.CreateScriptSourceFromFile(
@@ -186,66 +207,67 @@ namespace PyRevitLabs.PyRevit.Runtime {
             tempExec.AddEmbeddedLib(engine);
         }
 
+        private void LoadExecutionConfigs(ref ScriptRuntime runtime) {
+            var configs = new IronPythonEngineConfigs();
+            try {
+                configs = JsonConvert.DeserializeObject<IronPythonEngineConfigs>(
+                    runtime.ScriptRuntimeConfigs.EngineConfigs
+                ) ?? configs;
+            }
+            catch (Exception ex) {
+                logger.Warn(
+                    ex,
+                    "Failed to parse IronPython engine configuration: {0}",
+                    runtime.ScriptRuntimeConfigs.EngineConfigs
+                );
+            }
+            ExecEngineConfigs = configs;
+        }
+
+        /// <summary>
+        /// Creates the IronPython engine with UTF-8 standard streams already in place.
+        /// </summary>
+        /// <remarks>
+        /// IronPython 3 builds <c>sys.stdout</c>, <c>sys.stderr</c> and <c>sys.stdin</c> while the engine is
+        /// created and fixes their encoding name from the console writer at that moment. In a process without
+        /// a console that writer reports code page 0 and the name becomes <c>codepage___0</c>, which fails on
+        /// the first <c>print</c>. Redirecting the streams afterwards does not rename it, so the redirect
+        /// has to happen before the engine exists.
+        /// </remarks>
+        private static Microsoft.Scripting.Hosting.ScriptEngine CreateEngineWithUtf8Streams(IDictionary<string, object> flags) {
+#if IPY342
+            var scriptRuntime = IronPython.Hosting.Python.CreateRuntime(flags);
+            scriptRuntime.IO.SetOutput(Stream.Null, System.Text.Encoding.UTF8);
+            scriptRuntime.IO.SetErrorOutput(Stream.Null, System.Text.Encoding.UTF8);
+            scriptRuntime.IO.SetInput(Stream.Null, System.Text.Encoding.UTF8);
+            return IronPython.Hosting.Python.GetEngine(scriptRuntime);
+#else
+            return IronPython.Hosting.Python.CreateEngine(flags);
+#endif
+        }
+
         private void SetupStreams(ref ScriptRuntime runtime) {
             Engine.Runtime.IO.SetOutput(runtime.OutputStream, System.Text.Encoding.UTF8);
+            Engine.Runtime.IO.SetErrorOutput(runtime.OutputStream, System.Text.Encoding.UTF8);
             Engine.Runtime.IO.SetInput(runtime.OutputStream, System.Text.Encoding.UTF8);
         }
 
         private void SetupBuiltins(ref ScriptRuntime runtime) {
+            InjectBuiltins(Engine, runtime, RecoveredFromCache, TypeId);
+        }
+
+        // Keep reserved builtins consistent across command and interactive engines.
+        internal static void InjectBuiltins(Microsoft.Scripting.Hosting.ScriptEngine engine, ScriptRuntime runtime, bool recoveredFromCache, string typeId) {
             // BUILTINS -----------------------------------------------------------------------------------------------
             // Get builtin to add custom variables
-            var builtin = IronPython.Hosting.Python.GetBuiltinModule(Engine);
+            var builtin = IronPython.Hosting.Python.GetBuiltinModule(engine);
 
-            // Add timestamp and executuin uuid
-            builtin.SetVariable("__execid__", runtime.ExecId);
-            builtin.SetVariable("__timestamp__", runtime.ExecTimestamp);
+            foreach (var variable in ScriptBuiltins.CreateRuntimeVariables(
+                runtime, recoveredFromCache, typeId))
+                builtin.SetVariable(variable.Key, variable.Value);
 
-            // Let commands know if they're being run in a cached engine
-            builtin.SetVariable("__cachedengine__", RecoveredFromCache);
-
-            // Add current engine id to builtins
-            builtin.SetVariable("__cachedengineid__", TypeId);
-
-            // Add this script executor to the the builtin to be globally visible everywhere
-            // This support pyrevit functionality to ask information about the current executing command
-            builtin.SetVariable("__scriptruntime__", runtime);
-
-            // Add host application handle to the builtin to be globally visible everywhere
-            if (runtime.UIApp != null)
-                builtin.SetVariable("__revit__", runtime.UIApp);
-            else if (runtime.UIControlledApp != null)
-                builtin.SetVariable("__revit__", runtime.UIControlledApp);
-            else if (runtime.App != null)
-                builtin.SetVariable("__revit__", runtime.App);
-            else
-                builtin.SetVariable("__revit__", (object)null);
-
-            // Adding data provided by IExternalCommand.Execute
-            builtin.SetVariable("__commanddata__", runtime.ScriptRuntimeConfigs.CommandData);
-            builtin.SetVariable("__elements__", runtime.ScriptRuntimeConfigs.SelectedElements);
-
-            // Add ui button handle
-            builtin.SetVariable("__uibutton__", runtime.UIControl);
-
-            // Adding information on the command being executed
-            builtin.SetVariable("__commandpath__", Path.GetDirectoryName(runtime.ScriptData.ScriptPath));
-            builtin.SetVariable("__configcommandpath__", Path.GetDirectoryName(runtime.ScriptData.ConfigScriptPath));
-            builtin.SetVariable("__commandname__", runtime.ScriptData.CommandName);
-            builtin.SetVariable("__commandbundle__", runtime.ScriptData.CommandBundle);
-            builtin.SetVariable("__commandextension__", runtime.ScriptData.CommandExtension);
-            builtin.SetVariable("__commanduniqueid__", runtime.ScriptData.CommandUniqueId);
-            builtin.SetVariable("__commandcontrolid__", runtime.ScriptData.CommandControlId);
-            builtin.SetVariable("__forceddebugmode__", runtime.ScriptRuntimeConfigs.DebugMode);
-            builtin.SetVariable("__shiftclick__", runtime.ScriptRuntimeConfigs.ConfigMode);
-
-            // Add reference to the results dictionary
-            // so the command can add custom values for logging
-            builtin.SetVariable("__result__", runtime.GetResultsDictionary());
-
-            // EVENT HOOKS BUILTINS ----------------------------------------------------------------------------------
-            // set event arguments for engine
-            builtin.SetVariable("__eventsender__", runtime.ScriptRuntimeConfigs.EventSender);
-            builtin.SetVariable("__eventargs__", runtime.ScriptRuntimeConfigs.EventArgs);
+            foreach (var variable in ScriptBuiltins.FilterUserVariables(runtime.ScriptRuntimeConfigs?.Variables))
+                builtin.SetVariable(variable.Key, variable.Value);
         }
 
         private void SetupSearchPaths(ref ScriptRuntime runtime) {
@@ -265,8 +287,7 @@ namespace PyRevitLabs.PyRevit.Runtime {
 #endif
             // for python make sure the first argument is the script
             pythonArgv.append(runtime.ScriptSourceFile);
-            foreach (var obj in runtime.ScriptRuntimeConfigs.Arguments)
-            {
+            foreach (var obj in runtime.ScriptRuntimeConfigs.Arguments) {
                 pythonArgv.append(obj);
             }
             sysmodule.SetVariable("argv", pythonArgv);
@@ -303,6 +324,11 @@ namespace PyRevitLabs.PyRevit.Runtime {
             if (outStream != null) {
                 Engine.Runtime.IO.SetOutput(outStream.Item1, outStream.Item2);
                 outStream.Item1.Dispose();
+            }
+            Tuple<Stream, System.Text.Encoding> errStream = DefaultErrorStreamConfig;
+            if (errStream != null) {
+                Engine.Runtime.IO.SetErrorOutput(errStream.Item1, errStream.Item2);
+                errStream.Item1.Dispose();
             }
             Tuple<Stream, System.Text.Encoding> inStream = DefaultInputStreamConfig;
             if (inStream != null) {

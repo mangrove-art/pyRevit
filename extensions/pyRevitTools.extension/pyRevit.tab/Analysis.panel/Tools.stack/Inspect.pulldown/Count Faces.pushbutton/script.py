@@ -1,84 +1,186 @@
-from pyrevit import revit, script, DB
+# -*- coding: utf-8 -*-
+"""Count the triangles of every family type, or of every form in a family, at each detail level."""
 
-doc = revit.doc
-# currView = revit.active_view
+from pyrevit import forms, script
+from pyrevit import revit, DB
+from pyrevit.coreutils import applocales, escape_for_output
 
-# Get the output window
+logger = script.get_logger()
 output = script.get_output()
-output.close_others()
+
+RESOURCES = script.get_bundle_file("resources.xaml")
+DETAIL_LEVELS = [
+    DB.ViewDetailLevel.Coarse,
+    DB.ViewDetailLevel.Medium,
+    DB.ViewDetailLevel.Fine,
+]
 
 
-# Get Elements of the FamilyInstance Class
-elements = (
-    DB.FilteredElementCollector(doc)
-    .OfClass(DB.FamilyInstance)
-    .WhereElementIsNotElementType()
-    .ToElements()
-)
+def _t(key):
+    return applocales.get_locale_string_from_xaml(RESOURCES, key)
 
-grand_total = []
-table_data = []
-elements_name = []
-elements_count = []
-elements_category = []
-elements_type = []
 
-opt = DB.Options()
+def count_triangles(element, detail_level):
+    triangles = 0
+    for geometry in revit.query.get_geometry(element, detail_level=detail_level):
+        if isinstance(geometry, DB.Solid) and geometry.Faces.Size > 0:
+            for face in geometry.Faces:
+                mesh = face.Triangulate()
+                if mesh is not None:
+                    triangles += mesh.NumTriangles
+    return triangles
 
-for element in elements:
-    total_triangles = []
-    typeId = element.GetTypeId()
-    if typeId not in elements_type:
-        elements_type.append(typeId)
-        geometry_set = element.get_Geometry(opt)
+
+def count_triangles_per_level(element):
+    counts = []
+    for detail_level in DETAIL_LEVELS:
         try:
-            for geometry in geometry_set:
-                if isinstance(geometry, DB.Solid) and geometry.Faces.Size > 0:
-                    nbrtriangle = sum(
-                        [
-                            f.Triangulate().NumTriangles
-                            for f in geometry.Faces
-                            if f.Triangulate() is not None
-                        ]
-                    )
-                    total_triangles.append(nbrtriangle)
-                elif isinstance(geometry, DB.GeometryInstance):
-                    for instObj in geometry.SymbolGeometry:
-                        if isinstance(instObj, DB.Solid) and instObj.Faces.Size > 0:
-                            nbrtriangle = sum(
-                                [
-                                    f.Triangulate().NumTriangles
-                                    for f in instObj.Faces
-                                    if f.Triangulate() is not None
-                                ]
-                            )
-                            total_triangles.append(nbrtriangle)
-                else:
-                    pass
-            geometry_set.Dispose()
-            total_triangles = sum(total_triangles)
-            if total_triangles != 0:
-                elements_count.append(total_triangles)
-                elements_name.append(
-                    output.linkify(element.Id)
-                    + "**"
-                    + element.Name
-                    + "** (*Category*: "
-                    + element.Category.Name
-                    + ")"
+            counts.append(count_triangles(element, detail_level))
+        except Exception:
+            logger.debug(
+                "Triangles of element {} at {} detail could not be counted.".format(
+                    element.Id, detail_level
                 )
-                grand_total.append(total_triangles)
-        except:
-            pass
+            )
+            counts.append(0)
+    return counts
 
-# adding grand total and making a dictionary out of it
-elements_count.append(sum(grand_total))
-elements_name.append("Grand Total")
-my_dict = dict(zip(elements_name, elements_count))
 
-# output as a table
-output.print_table(
-    sorted(my_dict.items(), key=lambda item: item[1]),
-    ["Name", "Count"],
-    last_line_style="color:white;font-weight: bolder; background-color: gray;",
-)
+def collect_type_counts():
+    """Return one row per family type with at least one triangle.
+
+    Each row holds the first instance found, which stands in for its type, and the
+    triangle counts at coarse, medium and fine detail.
+    """
+    instances = revit.query.get_elements_by_class(DB.FamilyInstance, doc=revit.doc)
+    rows = {}
+    with forms.ProgressBar(
+        title=_t("progress_title"), cancellable=True, step=10
+    ) as progress:
+        for index, instance in enumerate(instances):
+            if progress.cancelled:
+                script.exit()
+            progress.update_progress(index, len(instances))
+            type_id = instance.GetTypeId()
+            if type_id in rows:
+                continue
+            counts = count_triangles_per_level(instance)
+            if any(counts):
+                rows[type_id] = (instance, counts)
+    return list(rows.values())
+
+
+def count_triangles_per_visibility(form):
+    """Return the triangle counts of a form at coarse, medium and fine detail.
+
+    The form is triangulated once, because Options.DetailLevel does not change the
+    geometry of a form in a family document. The count then applies to each detail
+    level the form is set to be visible in.
+    """
+    try:
+        triangles = count_triangles(form, DB.ViewDetailLevel.Medium)
+    except Exception:
+        logger.debug("Triangles of form {} could not be counted.".format(form.Id))
+        return [0, 0, 0]
+    visibility = form.GetVisibility()
+    shown = [
+        visibility.IsShownInCoarse,
+        visibility.IsShownInMedium,
+        visibility.IsShownInFine,
+    ]
+    return [triangles if is_shown else 0 for is_shown in shown]
+
+
+def collect_family_counts():
+    """Return one row per element of the family being edited with at least one triangle.
+
+    Rows cover the family's own forms and every nested family instance, counted
+    individually because instance parameters can change an instance's geometry. Each
+    row holds the element and the triangle counts at coarse, medium and fine detail.
+    """
+    family_forms = revit.query.get_elements_by_class(DB.GenericForm, doc=revit.doc)
+    nested_instances = revit.query.get_elements_by_class(
+        DB.FamilyInstance, doc=revit.doc
+    )
+    rows = []
+    with forms.ProgressBar(
+        title=_t("progress_title"), cancellable=True, step=10
+    ) as progress:
+        total = len(family_forms) + len(nested_instances)
+        for index, form in enumerate(family_forms):
+            if progress.cancelled:
+                script.exit()
+            progress.update_progress(index, total)
+            counts = count_triangles_per_visibility(form)
+            if any(counts):
+                rows.append((form, counts))
+        for index, instance in enumerate(nested_instances, len(family_forms)):
+            if progress.cancelled:
+                script.exit()
+            progress.update_progress(index, total)
+            counts = count_triangles_per_level(instance)
+            if any(counts):
+                rows.append((instance, counts))
+    return rows
+
+
+def element_label(element):
+    if isinstance(element, DB.GenericForm):
+        return element.GetType().Name
+    return element.Name
+
+
+def category_label(element):
+    category = element.Category
+    if category is None and revit.doc.IsFamilyDocument:
+        category = revit.doc.OwnerFamily.FamilyCategory
+    return category.Name if category else ""
+
+
+def report(element_counts, title_key, name_column_key):
+    fine_detail_index = DETAIL_LEVELS.index(DB.ViewDetailLevel.Fine)
+    element_counts = sorted(element_counts, key=lambda row: row[1][fine_detail_index])
+    table_data = [
+        [
+            escape_for_output(element_label(element)),
+            escape_for_output(category_label(element)),
+            output.linkify(element.Id),
+        ]
+        + counts
+        for element, counts in element_counts
+    ]
+    table_data.append(
+        [_t("grand_total"), "", ""]
+        + [sum(counts[index] for _, counts in element_counts) for index in range(3)]
+    )
+    output.print_table(
+        table_data,
+        title=_t(title_key),
+        columns=[
+            _t(name_column_key),
+            _t("column_category"),
+            _t("column_example"),
+            _t("column_coarse"),
+            _t("column_medium"),
+            _t("column_fine"),
+        ],
+        last_line_style="color:white;font-weight: bolder; background-color: gray;",
+    )
+
+
+def main():
+    output.close_others()
+    if revit.doc.IsFamilyDocument:
+        element_counts = collect_family_counts()
+        if not element_counts:
+            forms.alert(_t("no_geometry_family"), exitscript=True)
+        report(element_counts, "table_title_family", "column_form")
+    else:
+        element_counts = collect_type_counts()
+        if not element_counts:
+            forms.alert(_t("no_geometry"), exitscript=True)
+        report(element_counts, "table_title", "column_type")
+
+
+if __name__ == "__main__":
+    main()

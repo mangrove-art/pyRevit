@@ -1,22 +1,28 @@
 """Revit transactions facility."""
+
 from pyrevit import HOST_APP, DOCS, DB
 from pyrevit import coreutils
 from pyrevit.coreutils.logger import get_logger
 from pyrevit.revit.db import failure
 
 
-__all__ = ('carryout',
-           'Transaction', 'DryTransaction', 'TransactionGroup')
+__all__ = (
+    "carryout",
+    "Transaction",
+    "DryTransaction",
+    "TransactionGroup",
+    "DryTransactionGroup",
+)
 
 
-#pylint: disable=W0703,C0302,C0103
+# pylint: disable=W0703,C0302,C0103
 mlogger = get_logger(__name__)
 
 
-DEFAULT_TRANSACTION_NAME = 'pyRevit Transaction'
+DEFAULT_TRANSACTION_NAME = "pyRevit Transaction"
 
 
-class Transaction():
+class Transaction:
     """Adds a context manager around Revit Transaction object.
 
     Runs `Transaction.Start()` and `Transaction.Commit()`
@@ -27,37 +33,50 @@ class Transaction():
         with Transaction('Move Wall'):
             wall.DoSomething()
 
-        with Transaction('Move Wall', doc, clear_after_rollback=False, show_error_dialog=False, swallow_errors=False, log_errors=True, nested=False)) as action:
+        with Transaction('Move Wall', doc, clear_after_rollback=False, show_error_dialog=False, swallow_errors=False, log_errors=True, nested=False) as action:
             wall.DoSomething()
             assert action.status == ActionStatus.Started  # True
             assert action.status == ActionStatus.Committed    # True
         ```
+
+    Note:
+        `failures_preprocessor` takes any `DB.IFailuresPreprocessor` and wins
+        over `swallow_errors`. Both are ignored when the transaction runs as a
+        `SubTransaction` inside an already open transaction.
     """
-    def __init__(self, name=None,
-                 doc=None,
-                 clear_after_rollback=False,
-                 show_error_dialog=False,
-                 swallow_errors=False,
-                 log_errors=True,
-                 nested=False):
+
+    def __init__(
+        self,
+        name=None,
+        doc=None,
+        clear_after_rollback=False,
+        show_error_dialog=False,
+        swallow_errors=False,
+        log_errors=True,
+        nested=False,
+        failures_preprocessor=None,
+    ):
         doc = doc or DOCS.doc
         # create nested transaction if one is already open
         if doc.IsModifiable or nested:
-            self._rvtxn = \
-                DB.SubTransaction(doc)
+            self._rvtxn = DB.SubTransaction(doc)
         else:
-            self._rvtxn = \
-                DB.Transaction(doc, name if name else DEFAULT_TRANSACTION_NAME)
+            self._rvtxn = DB.Transaction(
+                doc, name if name else DEFAULT_TRANSACTION_NAME
+            )
             self._fhndlr_ops = self._rvtxn.GetFailureHandlingOptions()
-            self._fhndlr_ops = \
-                self._fhndlr_ops.SetClearAfterRollback(clear_after_rollback)
-            self._fhndlr_ops = \
-                self._fhndlr_ops.SetForcedModalHandling(show_error_dialog)
-            if swallow_errors:
-                self._fhndlr_ops = \
-                    self._fhndlr_ops.SetFailuresPreprocessor(
-                        failure.FailureSwallower()
-                        )
+            self._fhndlr_ops = self._fhndlr_ops.SetClearAfterRollback(
+                clear_after_rollback
+            )
+            self._fhndlr_ops = self._fhndlr_ops.SetForcedModalHandling(
+                show_error_dialog
+            )
+            if not failures_preprocessor and swallow_errors:
+                failures_preprocessor = failure.FailureSwallower()
+            if failures_preprocessor:
+                self._fhndlr_ops = self._fhndlr_ops.SetFailuresPreprocessor(
+                    failures_preprocessor
+                )
             self._rvtxn.SetFailureHandlingOptions(self._fhndlr_ops)
         self._logerror = log_errors
 
@@ -69,27 +88,31 @@ class Transaction():
         if exception:
             self._rvtxn.RollBack()
             if self._logerror:
-                mlogger.error('Error in Transaction Context. '
-                              'Rolling back changes. | %s:%s',
-                              exception, exception_value)
+                mlogger.error(
+                    "Error in Transaction Context. Rolling back changes. | %s:%s",
+                    exception,
+                    exception_value,
+                )
         else:
             try:
                 self._rvtxn.Commit()
             except Exception as errmsg:
                 self._rvtxn.RollBack()
                 if self._logerror:
-                    mlogger.error('Error in Transaction Commit. '
-                                  'Rolling back changes. | %s', errmsg)
+                    mlogger.error(
+                        "Error in Transaction Commit. Rolling back changes. | %s",
+                        errmsg,
+                    )
         self._rvtxn.Dispose()
 
     @property
     def name(self):
-        if hasattr(self._rvtxn, 'GetName'):
+        if hasattr(self._rvtxn, "GetName"):
             return self._rvtxn.GetName()
 
     @name.setter
     def name(self, new_name):
-        if hasattr(self._rvtxn, 'SetName'):
+        if hasattr(self._rvtxn, "SetName"):
             return self._rvtxn.SetName(new_name)
 
     @property
@@ -105,17 +128,19 @@ class Transaction():
 
 class DryTransaction(Transaction):
     """Wrapper to a transaction that doesn't commit anything (dry-run)."""
+
     def __exit__(self, exception, exception_value, traceback):
         self._rvtxn.RollBack()
         self._rvtxn.Dispose()
 
 
-class TransactionGroup():
+class TransactionGroup:
     """Transactions group with context manager."""
+
     def __init__(self, name=None, doc=None, assimilate=True, log_errors=True):
-        self._rvtxn_grp = \
-            DB.TransactionGroup(doc or DOCS.doc,
-                                name if name else DEFAULT_TRANSACTION_NAME)
+        self._rvtxn_grp = DB.TransactionGroup(
+            doc or DOCS.doc, name if name else DEFAULT_TRANSACTION_NAME
+        )
         self.assimilate = assimilate
         self._logerror = log_errors
 
@@ -127,9 +152,11 @@ class TransactionGroup():
         if exception:
             self._rvtxn_grp.RollBack()
             if self._logerror:
-                mlogger.error('Error in TransactionGroup Context. '
-                              'Rolling back changes. | %s:%s',
-                              exception, exception_value)
+                mlogger.error(
+                    "Error in TransactionGroup Context. Rolling back changes. | %s:%s",
+                    exception,
+                    exception_value,
+                )
         else:
             try:
                 if self.assimilate:
@@ -139,8 +166,10 @@ class TransactionGroup():
             except Exception as errmsg:
                 self._rvtxn_grp.RollBack()
                 if self._logerror:
-                    mlogger.error('Error in TransactionGroup Commit. '
-                                  'Rolling back changes. | %s', errmsg)
+                    mlogger.error(
+                        "Error in TransactionGroup Commit. Rolling back changes. | %s",
+                        errmsg,
+                    )
         self._rvtxn_grp.Dispose()
 
     @property
@@ -162,6 +191,23 @@ class TransactionGroup():
         return self._rvtxn_grp.HasEnded()
 
 
+class DryTransactionGroup(TransactionGroup):
+    """Transaction group that always rolls back, even when its body succeeds.
+
+    Transactions inside it commit normally, so `DocumentChanged` fires and
+    their effects can be inspected, then the whole group is discarded.
+
+    Invariant:
+        The document is left exactly as it was before the group started.
+    """
+
+    def __exit__(self, exception, exception_value, traceback):
+        try:
+            self._rvtxn_grp.RollBack()
+        finally:
+            self._rvtxn_grp.Dispose()
+
+
 def carryout(name, doc=None):
     """Transaction Decorator.
 
@@ -176,8 +222,8 @@ def carryout(name, doc=None):
     @doc.carryout('Do Something')
     def set_some_parameter(wall, value):
         wall.parameters['Comments'].value = value
-    
-    
+
+
     set_some_parameter(wall, value)
     ```
     """
@@ -189,5 +235,7 @@ def carryout(name, doc=None):
             with Transaction(name, doc=doc):
                 return_value = f(*args, **kwargs)
             return return_value
+
         return wrapped_f
+
     return wrap

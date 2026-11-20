@@ -1,9 +1,4 @@
 # -*- coding: UTF-8 -*-
-
-__cleanengine__ = True
-__fullframeengine__ = True
-__persistentengine__ = True
-
 from traceback import format_exc
 from csv import writer, reader
 from os.path import isfile
@@ -15,13 +10,47 @@ from System.Collections.Generic import HashSet
 from pyrevit.coreutils import Timer
 from pyrevit import HOST_APP
 from pyrevit import DB
+from pyrevit.compat import get_elementid_value_func
 from pyrevit.script import get_config, get_logger
 from pyrevit.forms import alert, show_balloon
 from pyrevit.output.cards import card_builder, create_frame
 from pyrevit.revit.db import ProjectInfo as RevitProjectInfo
+import os
+
+from pyrevit.coreutils import applocales
 from pyrevit.preflight import PreflightTestCase
 import pyrevit.revit.db.query as q
 import pyrevit.revit.db.count as cnt
+
+_XAML = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "locale", "Checks.xaml"
+)
+
+
+def _t(key):
+    return applocales.get_locale_string_from_xaml(_XAML, key)
+
+
+get_elementid_value = get_elementid_value_func()
+
+
+def _get_placed_view_ids(document, sheets):
+    placed_ids = set()
+    for sheet in sheets:
+        placed_ids.update(get_elementid_value(x) for x in sheet.GetAllPlacedViews())
+    placed_ids.update(
+        get_elementid_value(x.ScheduleId) for x in q.get_schedules_instances(document)
+    )
+    panel_schedule_instances = (
+        DB.FilteredElementCollector(document)
+        .OfClass(DB.Electrical.PanelScheduleSheetInstance)
+        .ToElements()
+    )
+    placed_ids.update(
+        get_elementid_value(x.ScheduleId) for x in panel_schedule_instances
+    )
+    return placed_ids
+
 
 logger = get_logger()
 
@@ -50,7 +79,8 @@ FILE_INFO_HEADERS = [
     "Pinned status",
 ]
 
-VALID_VIEW_TYPES = [
+# Base list excludes view types that may be added/removed by Revit version
+_VALID_VIEW_TYPES_BASE = [
     DB.ViewType.FloorPlan,
     DB.ViewType.CeilingPlan,
     DB.ViewType.Elevation,
@@ -66,13 +96,36 @@ VALID_VIEW_TYPES = [
     DB.ViewType.Detail,
     DB.ViewType.CostReport,
     DB.ViewType.LoadsReport,
-    DB.ViewType.PresureLossReport,
     DB.ViewType.ColumnSchedule,
     DB.ViewType.PanelSchedule,
     DB.ViewType.Walkthrough,
     DB.ViewType.Rendering,
-    DB.ViewType.SystemsAnalysisReport,
 ]
+# PresureLossReport typo was corrected in Revit 2027
+_PresureLossReport = getattr(
+    DB.ViewType,
+    "PresureLossReport" if HOST_APP.is_older_than(2027) else "PressureLossReport",
+    None,
+)
+_SystemsAnalysisReport = getattr(DB.ViewType, "SystemsAnalysisReport", None)
+VALID_VIEW_TYPES = list(_VALID_VIEW_TYPES_BASE)
+if _PresureLossReport is not None:
+    VALID_VIEW_TYPES.insert(
+        VALID_VIEW_TYPES.index(DB.ViewType.LoadsReport) + 1, _PresureLossReport
+    )
+if _SystemsAnalysisReport is not None:
+    VALID_VIEW_TYPES.append(_SystemsAnalysisReport)
+
+_NOT_PLACEABLE_VIEW_TYPES = {
+    DB.ViewType.DrawingSheet,
+    DB.ViewType.CostReport,
+    DB.ViewType.LoadsReport,
+    DB.ViewType.Walkthrough,
+}
+if _PresureLossReport is not None:
+    _NOT_PLACEABLE_VIEW_TYPES.add(_PresureLossReport)
+if _SystemsAnalysisReport is not None:
+    _NOT_PLACEABLE_VIEW_TYPES.add(_SystemsAnalysisReport)
 
 INVALID_VIEW_TYPES = [
     DB.ViewType.Undefined,
@@ -119,9 +172,11 @@ class ElementCounts:
             .WhereElementIsNotElementType()
             .GetElementCount()
         )
-        self.purgeable_elements_count = len(
-            document.GetUnusedElements(HashSet[DB.ElementId]())
-        )
+        self.purgeable_elements_count = None
+        if HOST_APP.is_newer_than(2024, or_equal=True):
+            self.purgeable_elements_count = len(
+                document.GetUnusedElements(HashSet[DB.ElementId]())
+            )
         self.activated_analytical_model_elements_count = (
             cnt.count_analytical_model_activated(document)
         )
@@ -154,7 +209,9 @@ class SheetViewInfo:
     """Handles sheets and views metrics."""
 
     def __init__(self, document, sheets_set, views):
-        schedules = [schedule for schedule in views if schedule.ViewType == DB.ViewType.Schedule]
+        schedules = [
+            schedule for schedule in views if schedule.ViewType == DB.ViewType.Schedule
+        ]
         self.sheets_count = len(sheets_set)
         self.views_count = len(views)
         self.views_floorplans_count = sum(
@@ -198,8 +255,10 @@ class SheetViewInfo:
         self.views_loads_report_count = sum(
             1 for x in views if x.ViewType == DB.ViewType.LoadsReport
         )
-        self.views_presure_loss_report_count = sum(
-            1 for x in views if x.ViewType == DB.ViewType.PresureLossReport
+        self.views_presure_loss_report_count = (
+            sum(1 for x in views if x.ViewType == _PresureLossReport)
+            if _PresureLossReport is not None
+            else 0
         )
         self.views_column_schedule_count = sum(
             1 for x in views if x.ViewType == DB.ViewType.ColumnSchedule
@@ -213,15 +272,30 @@ class SheetViewInfo:
         self.views_rendering_count = sum(
             1 for x in views if x.ViewType == DB.ViewType.Rendering
         )
-        self.views_systems_analysis_report_count = sum(
-            1 for x in views if x.ViewType == DB.ViewType.SystemsAnalysisReport
+        self.views_systems_analysis_report_count = (
+            sum(1 for x in views if x.ViewType == _SystemsAnalysisReport)
+            if _SystemsAnalysisReport is not None
+            else 0
         )
-        self.views_not_on_sheets = sum(
-            1 for x in views if x.GetPlacementOnSheetStatus() == DB.ViewPlacementOnSheetStatus.NotPlaced
-        )
-        self.schedules_not_sheeted_count = sum(
-            1 for x in schedules if x.GetPlacementOnSheetStatus() == DB.ViewPlacementOnSheetStatus.NotPlaced
-        )
+        if HOST_APP.is_newer_than(2023, or_equal=True):
+            not_placed = DB.ViewPlacementOnSheetStatus.NotPlaced
+            self.views_not_on_sheets = sum(
+                1 for x in views if x.GetPlacementOnSheetStatus() == not_placed
+            )
+            self.schedules_not_sheeted_count = sum(
+                1 for x in schedules if x.GetPlacementOnSheetStatus() == not_placed
+            )
+        else:
+            placed_ids = _get_placed_view_ids(document, sheets_set)
+            self.views_not_on_sheets = sum(
+                1
+                for x in views
+                if x.ViewType not in _NOT_PLACEABLE_VIEW_TYPES
+                and get_elementid_value(x.Id) not in placed_ids
+            )
+            self.schedules_not_sheeted_count = sum(
+                1 for x in schedules if get_elementid_value(x.Id) not in placed_ids
+            )
         self.copied_views_count = cnt.count_copied_views(views)
 
 
@@ -229,16 +303,15 @@ class ViewTemplateFilterInfo:
     """Manages view templates and filters."""
 
     def __init__(self, document, views):
-        filters = q.get_all_view_templates(document)
-        self.view_templates_count = len(filters)
+        view_template_list = q.get_all_view_templates(document)
+        self.view_templates_count = len(view_template_list)
         self.unused_view_templates_count = cnt.count_unused_view_templates(
             views, document
         )
-        self.all_filters_count = len(
-            q.get_elements_by_class(DB.ParameterFilterElement, doc=document)
-        )
+        filters_list = q.get_elements_by_class(DB.ParameterFilterElement, doc=document)
+        self.all_filters_count = len(filters_list)
         self.unused_view_filters_count = cnt.count_unused_filters_in_views(
-            views, filters
+            views, filters_list
         )
 
 
@@ -519,17 +592,22 @@ class ReportData:
 
         sheets_set = q.get_sheets(doc=document)
         views = q.get_elements_by_categories(
-            [DB.BuiltInCategory.OST_Views,
-             DB.BuiltInCategory.OST_Sections,
-             DB.BuiltInCategory.OST_Schedules,
-             DB.BuiltInCategory.OST_PipeSchedules,
-             DB.BuiltInCategory.OST_HVAC_Load_Schedules,
-             ], doc=document
+            [
+                DB.BuiltInCategory.OST_Views,
+                DB.BuiltInCategory.OST_Sections,
+                DB.BuiltInCategory.OST_Schedules,
+                DB.BuiltInCategory.OST_PipeSchedules,
+                DB.BuiltInCategory.OST_HVAC_Load_Schedules,
+            ],
+            doc=document,
         )
         views_without_templates = []
         for v in views:
-            if hasattr(v, "IsTemplate") and v.IsTemplate is False and \
-               v.ViewType not in INVALID_VIEW_TYPES:
+            if (
+                hasattr(v, "IsTemplate")
+                and v.IsTemplate is False
+                and v.ViewType not in INVALID_VIEW_TYPES
+            ):
                 views_without_templates.append(v)
             # else:
             #     print(v.Name, v.Category.Name)
@@ -591,6 +669,8 @@ class ReportData:
             return "".join(escape_map.get(c, c) for c in str(s))
 
         def format_value(value):
+            if value is None:
+                return "n/a"
             if isinstance(value, list):
                 return '"{}"'.format(", ".join(html_escape(v) for v in value))
             return html_escape(value)
@@ -604,7 +684,8 @@ class ReportData:
         """
         Exports the current data to a CSV file.
         If the CSV file does not exist, it creates a new file and writes the headers and data.
-        If the CSV file exists, it appends the data only if a row with the same date and document name does not already exist.
+        If the CSV file exists, it appends the data only if a row with the same date and document
+        name does not already exist.
 
         Args:
             export_file_path (str): The path to the CSV file. Defaults to EXPORT_FILE_PATH.
@@ -650,7 +731,9 @@ def get_revit_link_pinning_status(rvtlink_instance=None):
     return (
         "-"
         if not hasattr(rvtlink_instance, "Pinned")
-        else "Unpinned" if not rvtlink_instance.Pinned else "Pinned"
+        else "Unpinned"
+        if not rvtlink_instance.Pinned
+        else "Pinned"
     )
 
 
@@ -665,12 +748,16 @@ def generate_html_content(data, links_cards=""):
     Returns:
         str: Combined HTML content for the report.
     """
+    purgeable_count = data.element_counts.purgeable_elements_count
+    purgeable_card = (
+        ""
+        if purgeable_count is None
+        else card_builder(1000, purgeable_count, " Purgeable (2024+)")
+    )
     critical_elements_frame = create_frame(
         "Critical Elements",
         card_builder(100000, data.element_counts.element_count, " Elements"),
-        card_builder(
-            1000, data.element_counts.purgeable_elements_count, " Purgeable (2024+)"
-        ),
+        purgeable_card,
         card_builder(100, data.warnings_info.all_warnings_count, " Warnings"),
         card_builder(
             5, data.warnings_info.critical_warnings_count, " Critical Warnings"
@@ -929,8 +1016,19 @@ def audit_document(doc, output):
             "N/A",
             "N/A",
         ]
-        output.print_md("# Main File Infos")
-        output.print_table([project_info], columns=FILE_INFO_HEADERS)
+        output.print_md("# {}".format(_t("AuditAllMainFileInfos")))
+        translated_headers = [
+            _t("AuditAllProjectName"),
+            _t("AuditAllProjectNumber"),
+            _t("AuditAllClientName"),
+            _t("AuditAllProjectPhases"),
+            _t("AuditAllWorksets"),
+            _t("AuditAllLinkedFileName"),
+            _t("ModelCheckerInstanceName"),
+            _t("AuditAllLoadedStatus"),
+            _t("ModelCheckerPinnedStatus"),
+        ]
+        output.print_table([project_info], columns=translated_headers)
 
         # Linked files infos
         links_cards = ""
@@ -938,6 +1036,12 @@ def audit_document(doc, output):
         links_documents_data = []
         for rvt_link_instance in q.get_linked_model_instances(doc).ToElements():
             link_doc = rvt_link_instance.GetLinkDocument()
+            if not link_doc:
+                logger.error(
+                    "Link '%s' is not loaded -- skipping.",
+                    q.get_rvt_link_instance_name(rvt_link_instance),
+                )
+                continue
             link_document_data = ReportData(link_doc)
             link_data.append(
                 [
@@ -958,12 +1062,14 @@ def audit_document(doc, output):
             )
             links_documents_data.append(link_document_data)
         if link_data:
-            output.print_md("# Linked Files Infos")
-            output.print_table(link_data, columns=FILE_INFO_HEADERS)
+            output.print_md("# {}".format(_t("AuditAllLinkedFilesInfos")))
+            output.print_table(link_data, columns=translated_headers)
             links_cards = card_builder(
-                50, data.links_info.rvtlinks_count, " Links"
+                50, data.links_info.rvtlinks_count, " {}".format(_t("AuditAllLinks"))
             ) + card_builder(
-                0, data.links_info.rvtlinks_unpinned_count, " Links not pinned"
+                0,
+                data.links_info.rvtlinks_unpinned_count,
+                " {}".format(_t("AuditAllLinksNotPinned")),
             )
 
         output.print_md(
@@ -975,7 +1081,7 @@ def audit_document(doc, output):
         data.export_to_csv()
 
         if data.rvtlinks_elements_items:
-            output.print_md("# RVTLinks")
+            output.print_md("# {}".format(_t("ModelCheckerRVTLinks")))
             for link_doc_data in links_documents_data:
                 generate_rvt_links_report(link_doc_data, output)
     except Exception as e:
@@ -1000,11 +1106,13 @@ def generate_rvt_links_report(link_document_data, output):
     links_data = ""
     if link_document_data.rvtlinks_elements_items:
         links_data = card_builder(
-            50, link_document_data.links_info.rvtlinks_count, " Links"
+            50,
+            link_document_data.links_info.rvtlinks_count,
+            " {}".format(_t("AuditAllLinks")),
         ) + card_builder(
             0,
             link_document_data.links_info.rvtlinks_unpinned_count,
-            " Links not pinned",
+            " {}".format(_t("AuditAllLinksNotPinned")),
         )
     html_content = generate_html_content(link_document_data, links_data)
     output.print_html(html_content)
@@ -1012,59 +1120,7 @@ def generate_rvt_links_report(link_document_data, output):
 
 
 class ModelChecker(PreflightTestCase):
-    """
-    Preflight audit of all models, including linked models.
-    !!Links must be loaded.!!
-    This QC tools returns the following data:
-    - project name, number, client, phases, worksets
-    - element count
-    - purgeable elements count
-    - all warnings count
-    - critical warnings count
-    - rvtlinks count
-    - activated analytical model elements count
-    - rooms count
-    - unplaced rooms count
-    - unbounded rooms count
-    - sheets count
-    - views count per ViewType
-    - views not on sheets
-    - schedules not sheeted count
-    - copied views count
-    - view templates count
-    - unused view templates count
-    - filters count
-    - unused view filters count
-    - materials count
-    - line patterns count
-    - dwgs count
-    - linked dwg count
-    - imported dwg count
-    - inplace family count
-    - not parametric families count
-    - family count
-    - imports subcats count
-    - generic models types count
-    - detail components count
-    - text notes types count
-    - text notes types with width factor != 1
-    - text notes count
-    - text notes with allCaps applied
-    - text notes with solid background
-    - detail groups count
-    - detail groups types count
-    - model group count
-    - model group type count
-    - reference planes count
-    - unnamed reference planes count
-    - detail lines count
-    - dimension types count
-    - dimension count
-    - dimension overrides count
-    - revision clouds count
-    """
-
-    name = "Audit All (Including Links)"
+    name = _t("CheckName_AuditAll")
     author = "Jean-Marc Couffin"
 
     def setUp(self, doc, output):
@@ -1078,3 +1134,6 @@ class ModelChecker(PreflightTestCase):
         endtime_hms = str(timedelta(seconds=endtime))
         endtime_hms_claim = " \n\nCheck duration " + endtime_hms[0:7]
         output.print_md(endtime_hms_claim)
+
+
+ModelChecker.__doc__ = _t("CheckDescription_AuditAll")

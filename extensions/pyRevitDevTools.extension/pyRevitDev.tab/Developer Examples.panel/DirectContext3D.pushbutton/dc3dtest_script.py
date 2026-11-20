@@ -11,7 +11,10 @@ uidoc = revit.uidoc
 logger = script.get_logger()
 output = script.get_output()
 
+
 class UI(forms.WPFWindow):
+    resolve_theme = True
+
     def __init__(self, xaml_file_name):
         forms.WPFWindow.__init__(self, xaml_file_name, handle_esc=False)
 
@@ -40,7 +43,7 @@ class UI(forms.WPFWindow):
                 int(self.txtRed.Text),
                 int(self.txtGreen.Text),
                 int(self.txtBlue.Text),
-                int(self.txtTransp.Text)
+                int(self.txtTransp.Text),
             )
 
         except ValueError:
@@ -49,9 +52,9 @@ class UI(forms.WPFWindow):
 
         bb = DB.BoundingBoxXYZ()
         bb.Min = DB.XYZ(
-            - width / 2,
-            - length / 2,
-            - height / 2,
+            -width / 2,
+            -length / 2,
+            -height / 2,
         )
         bb.Max = DB.XYZ(
             width / 2,
@@ -59,19 +62,26 @@ class UI(forms.WPFWindow):
             height / 2,
         )
 
-        bb.Transform = DB.Transform.CreateTranslation(
-            DB.XYZ(x, y, z)
-        )
+        bb.Transform = DB.Transform.CreateTranslation(DB.XYZ(x, y, z))
 
-        mesh = revit.dc3dserver.Mesh.from_boundingbox(
-            bb,
-            color
-        )
+        mesh = revit.dc3dserver.Mesh.from_boundingbox(bb, color)
 
         self.server.meshes = [mesh]
         uidoc.RefreshActiveView()
 
     def button_select(self, sender, args):
+        override_color = None
+        if self.chkOverrideColor.IsChecked:
+            try:
+                override_color = DB.ColorWithTransparency(
+                    int(self.txtRed.Text),
+                    int(self.txtGreen.Text),
+                    int(self.txtBlue.Text),
+                    int(self.txtTransp.Text),
+                )
+            except ValueError:
+                forms.alert("Color input invalid!", sub_msg=traceback.format_exc())
+                return
         element = revit.pick_element()
         geometry = revit.query.get_geometry(element)
 
@@ -79,13 +89,49 @@ class UI(forms.WPFWindow):
         for geo in geometry:
             if not isinstance(geo, DB.Solid) or geo.Volume == 0:
                 continue
-            solid_mesh = revit.dc3dserver.Mesh.from_solid(doc, geo)
+            solid_mesh = revit.dc3dserver.Mesh.from_solid(
+                doc, geo, color=override_color
+            )
             if not solid_mesh:
                 continue
             mesh.append(solid_mesh)
 
         self.server.meshes = mesh
         uidoc.RefreshActiveView()
+
+    def button_load_stl(self, sender, args):
+        try:
+            x = float(self.txtCoordX.Text)
+            y = float(self.txtCoordY.Text)
+            z = float(self.txtCoordZ.Text)
+            color = DB.ColorWithTransparency(
+                int(self.txtRed.Text),
+                int(self.txtGreen.Text),
+                int(self.txtBlue.Text),
+                int(self.txtTransp.Text),
+            )
+            scale = float(self.txtSTLScale.Text)
+        except ValueError:
+            forms.alert("Input value invalid!", sub_msg=traceback.format_exc())
+            return
+
+        stl_path = script.get_bundle_file("model.STL")
+
+        transform = DB.Transform.CreateTranslation(DB.XYZ(x, y, z))
+        transform = transform.ScaleBasis(scale)
+
+        mesh = revit.dc3dserver.Mesh.from_stl(stl_path, color, transform=transform)
+
+        if mesh:
+            self.server.meshes = [mesh]
+            uidoc.RefreshActiveView()
+            forms.alert("STL loaded successfully!")
+        else:
+            forms.alert(
+                "Failed to load STL",
+                sub_msg="Check the output window for error details.",
+            )
+
 
 ui = UI("ui.xaml")
 ui.show(modal=False)

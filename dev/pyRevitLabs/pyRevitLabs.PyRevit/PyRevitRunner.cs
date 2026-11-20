@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -8,6 +8,8 @@ using System.Diagnostics;
 
 using pyRevitLabs.Common;
 using pyRevitLabs.Common.Extensions;
+using pyRevitLabs.Json;
+using pyRevitLabs.Json.Linq;
 using pyRevitLabs.NLog;
 using pyRevitLabs.TargetApps.Revit;
 
@@ -19,7 +21,18 @@ namespace pyRevitLabs.PyRevit {
             return $"{Name} | \"{Path}\"";
         }
 
-        public string Name => System.IO.Path.GetFileName(Path).Replace(PyRevitConsts.ExtensionUICommandPostfix, "");
+        /// <summary>
+        /// The command file name without its trailing <c>_command.py</c>, matched case-insensitively.
+        /// </summary>
+        public string Name {
+            get {
+                string fileName = System.IO.Path.GetFileName(Path);
+                string postfix = PyRevitConsts.ExtensionUICommandPostfix;
+                return fileName.EndsWith(postfix, StringComparison.OrdinalIgnoreCase)
+                    ? fileName.Substring(0, fileName.Length - postfix.Length)
+                    : fileName;
+            }
+        }
         public string Path { get; }
     }
 
@@ -36,13 +49,14 @@ namespace pyRevitLabs.PyRevit {
             // generate unique id for this execution
             ExecutionId = Guid.NewGuid().ToString();
             // setup working dir
-            WorkingDirectory = Path.Combine(Environment.GetEnvironmentVariable("TEMP"), ExecutionId);
+            WorkingDirectory = Path.Combine(CommonUtils.GetUserTempDirectory(), ExecutionId);
             CommonUtils.EnsurePath(WorkingDirectory);
         }
 
         private const string JournalNameTemplate = "PyRevitRunner_{0}.txt";
         private const string LogNameTemplate = "PyRevitRunner_{0}.log";
         private const string ManifestNameTemplate = "PyRevitRunner.addin";
+        private const string DefaultEngineConfigs = "{\"full_frame\": true}";
 
         private const string JournalTemplate = @"' pyrevitrunner generated journal
 ' 0:< 'C {0};
@@ -53,11 +67,13 @@ Jrn.Directive ""DebugMode"", ""PermissiveJournal"", 1
 Jrn.RibbonEvent ""TabActivated:Add-Ins""
 Jrn.RibbonEvent ""Execute external command:CustomCtrl_%CustomCtrl_%Add-Ins%pyRevitRunner%PyRevitRunnerCommand:PyRevitRunner.PyRevitRunnerCommand""
 Jrn.Data ""APIStringStringMapJournalData""  _
-    , 4 _
+    , 6 _
     , ""ScriptSource"" , ""{2}"" _
     , ""SearchPaths"" , ""{3}"" _
     , ""Models"" , ""{4}"" _
-    , ""LogFile"" , ""{5}""
+    , ""EngineConfigs"" , ""{5}"" _
+    , ""LogFile"" , ""{6}"" _
+    , ""Inputs"" , ""{7}""
 Jrn.Command ""SystemMenu"" , ""Quit the application; prompts to save projects , ID_APP_EXIT""
 Jrn.Data ""TaskDialogResult"" , ""Do you want to save changes to Untitled?"", ""No"", ""IDNO""
 ";
@@ -66,6 +82,7 @@ Jrn.Data ""TaskDialogResult"" , ""Do you want to save changes to Untitled?"", ""
             Script = script;
             ModelPaths = modelPaths;
             AllowDialogs = opts.AllowDialogs;
+            InputsJson = opts.InputsJson;
 
             // generate journal and manifest file
             GenerateJournal();
@@ -85,6 +102,7 @@ Jrn.Data ""TaskDialogResult"" , ""Do you want to save changes to Untitled?"", ""
         public string Script { get; private set; }
         public IEnumerable<string> ModelPaths { get; private set; }
         public bool AllowDialogs { get; private set; }
+        public string InputsJson { get; private set; }
         public bool PurgeAfterExec { get; private set; }
 
         public RevitProduct Revit { get { return Attachment.Product; } }
@@ -121,6 +139,7 @@ Jrn.Data ""TaskDialogResult"" , ""Do you want to save changes to Untitled?"", ""
         }
 
         private void GenerateJournal() {
+            var engineConfigs = EscapeJournalString(DefaultEngineConfigs);
             File.WriteAllText(
                 JournalFile,
                 string.Format(
@@ -130,9 +149,13 @@ Jrn.Data ""TaskDialogResult"" , ""Do you want to save changes to Untitled?"", ""
                     Script,                                             // script path
                     "",                                                 // sys paths
                     string.Join(";", ModelPaths),                       // model paths
-                    LogFile                                             // log file
+                    engineConfigs,                                      // engine configs
+                    LogFile,                                            // log file
+                    EscapeJournalString(InputsJson ?? "")
                 ));
         }
+
+        private static string EscapeJournalString(string value) => value.Replace("\"", "\"\"");
 
         private void GenerateManifest() {
             RevitAddons.CreateManifestFile(Revit.ProductYear,
@@ -145,8 +168,7 @@ Jrn.Data ""TaskDialogResult"" , ""Do you want to save changes to Untitled?"", ""
                                       addinPath: WorkingDirectory);
         }
 
-        private static void CopyAll(DirectoryInfo source, DirectoryInfo target)
-        {
+        private static void CopyAll(DirectoryInfo source, DirectoryInfo target) {
             if (source.FullName.NormalizeAsPath() == target.FullName.NormalizeAsPath())
                 return;
 
@@ -154,15 +176,13 @@ Jrn.Data ""TaskDialogResult"" , ""Do you want to save changes to Untitled?"", ""
             CommonUtils.EnsurePath(target.FullName);
 
             // Copy each file into it's new directory.
-            foreach (FileInfo fi in source.GetFiles())
-            {
+            foreach (FileInfo fi in source.GetFiles()) {
                 logger.Debug(@"Copying {0}\{1}", target.FullName, fi.Name);
                 fi.CopyTo(Path.Combine(target.ToString(), fi.Name), true);
             }
 
             // Copy each subdirectory using recursion.
-            foreach (DirectoryInfo diSourceSubDir in source.GetDirectories())
-            {
+            foreach (DirectoryInfo diSourceSubDir in source.GetDirectories()) {
                 DirectoryInfo nextTargetSubDir =
                     target.CreateSubdirectory(diSourceSubDir.Name);
                 CopyAll(diSourceSubDir, nextTargetSubDir);
@@ -179,10 +199,70 @@ Jrn.Data ""TaskDialogResult"" , ""Do you want to save changes to Untitled?"", ""
         public bool PurgeTempFiles { get; set; } = false;
         public bool AllowDialogs { get; set; } = false;
         public string ImportPath { get; set; }
+
+        /// <summary>
+        /// The JSON object the script receives as <c>__inputs__</c>, as produced by
+        /// <see cref="PyRevitRunner.NormalizeInputs"/>. Null or empty gives the script an empty object.
+        /// </summary>
+        public string InputsJson { get; set; }
     }
 
     public static class PyRevitRunner {
         private static readonly Logger logger = LogManager.GetCurrentClassLogger();
+
+        /// <summary>
+        /// Validates caller-supplied script inputs and rewrites them as the single-line ASCII JSON the
+        /// runner journal can carry.
+        /// </summary>
+        /// <param name="inputsJson">JSON text; null or whitespace means no inputs.</param>
+        /// <returns>Compact JSON with non-ASCII characters escaped, or null when no inputs were given.</returns>
+        /// <exception cref="PyRevitException">The text is not valid JSON, or is not a JSON object.</exception>
+        public static string NormalizeInputs(string inputsJson) {
+            if (string.IsNullOrWhiteSpace(inputsJson))
+                return null;
+
+            JToken parsed;
+            try {
+                using (var reader = new JsonTextReader(new StringReader(inputsJson)) { DateParseHandling = DateParseHandling.None }) {
+                    parsed = JToken.ReadFrom(reader);
+                    if (reader.Read())
+                        throw new PyRevitException("Inputs are not valid JSON: unexpected text after the JSON value.");
+                }
+            }
+            catch (JsonException ex) {
+                throw new PyRevitException($"Inputs are not valid JSON: {ex.Message}");
+            }
+
+            if (parsed.Type != JTokenType.Object)
+                throw new PyRevitException("Inputs must be a JSON object.");
+
+            using (var stringWriter = new StringWriter())
+            using (var jsonWriter = new JsonTextWriter(stringWriter) {
+                Formatting = Formatting.None,
+                StringEscapeHandling = StringEscapeHandling.EscapeNonAscii
+            }) {
+                parsed.WriteTo(jsonWriter);
+                jsonWriter.Flush();
+                return stringWriter.ToString();
+            }
+        }
+
+        /// <summary>
+        /// Resolves the <c>--inputs</c> / <c>--inputs-file</c> options of <c>pyrevit run</c> to the
+        /// validated, single-line JSON the runner journal carries.
+        /// </summary>
+        /// <param name="inputsJson">JSON text from <c>--inputs</c>, or null.</param>
+        /// <param name="inputsFile">Path of a JSON file from <c>--inputs-file</c>, read instead of <paramref name="inputsJson"/> when given.</param>
+        /// <returns>The result of <see cref="NormalizeInputs"/>.</returns>
+        /// <exception cref="PyRevitException">The file is missing, or the text is not a JSON object.</exception>
+        public static string ReadInputs(string inputsJson, string inputsFile) {
+            if (inputsFile != null) {
+                if (!File.Exists(inputsFile))
+                    throw new PyRevitException($"Inputs file not found: \"{inputsFile}\"");
+                inputsJson = File.ReadAllText(inputsFile);
+            }
+            return NormalizeInputs(inputsJson);
+        }
 
         public static PyRevitRunnerExecEnv Run(PyRevitAttachment attachment,
                                                string scriptPath,
@@ -215,7 +295,7 @@ Jrn.Data ""TaskDialogResult"" , ""Do you want to save changes to Untitled?"", ""
                 revitProcess.WaitForExit();
             }
             execEnv.End(opts);
-            
+
             return execEnv;
         }
     }

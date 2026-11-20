@@ -1,12 +1,17 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
+using System.Linq;
 using pyRevitLabs.Common.Extensions;
+using pyRevitLabs.TargetApps.Revit;
 
-namespace pyRevitCLI
-{
+namespace pyRevitCLI {
     internal static class PyRevitCLIAppHelps {
-        internal static void PrintHelp(PyRevitCLICommandType commandType)
-        {
+        private static readonly string RevitYearExample =
+            "Revit version year e.g. " + RevitProductData.MinimumSupportedProductYear;
+        private const string EngineVersionDescription =
+            "Engine version to be used: 2712 (IronPython 2.7.12) or 342 (IronPython 3.4.2)";
+
+        internal static void PrintHelp(PyRevitCLICommandType commandType) {
             PrintHelp(commandType, 0);
         }
         internal static void PrintHelp(PyRevitCLICommandType commandType, int exitCode) {
@@ -19,7 +24,7 @@ namespace pyRevitCLI
                         footer: "Run 'pyrevit COMMAND --help' for more information on a command.",
                         optionsfirst: true,
                         mgmtCommands: new Dictionary<string, string>() {
-                            { "env",                    "Print environment information" },
+                            { "env",                    "Print environment information and manage the system PATH" },
                             { "update",                 "Update remote resources used by this utility" },
                             { "clones",                 "Manage pyRevit clones" },
                             { "extensions",             "Manage pyRevit extensions" },
@@ -28,16 +33,19 @@ namespace pyRevitCLI
                             { "revits",                 "Manage installed Revits" },
                             { "caches",                 "Manage pyRevit caches" },
                             { "configs",                "Manage pyRevit configurations" },
+                            { "agent",                  "Talk to Revit sessions through the pyRevit agent host" },
                         },
                         commands: new Dictionary<string, string>() {
-                            { "clone",                  "Create a clone of pyRevit on this machine" },
+                            { "clone",                  "Create a clone of pyRevit (downloads pre-built bin/ from public GitHub Release assets)" },
                             { "extend",                 "Create a clone of a third-party pyRevit extension on this machine" },
                             { "attach",                 "Attach pyRevit clone to installed Revit" },
                             { "switch",                 "Switch active pyRevit clone" },
                             { "detach",                 "Detach pyRevit clone from installed Revit" },
                             { "config",                 "Configure pyRevit for current user" },
                             { "run",                    "Run python script in Revit" },
+                            { "launch",                 "Start Revit on a clone and engine without changing the attachment" },
                             { "doctor",                 "Fix potential or real problems" },
+                            { "mcp",                    "Run the pyRevit MCP server, or register it with an MCP client" },
                         },
                         helpCommands: new Dictionary<string, string>() {
                             { "wiki",                   "Open pyRevit Wiki" },
@@ -61,9 +69,18 @@ namespace pyRevitCLI
                 case PyRevitCLICommandType.Env:
                     BuildHelp(
                         new List<string>() { "env" },
-                        header: "Print environment information.",
+                        header: "Print environment information and manage the system PATH",
+                        commands: new Dictionary<string, string>() {
+                            { "path",                  "List, add or remove directories in the user or machine PATH" },
+                        },
                         options: new Dictionary<string, string>() {
                             { "--json",                 "Switch output format to json" },
+                            { "--redact",               "Mask user names, user profile folders, server names and Git URLs so the report can be shared publicly" },
+                            { "list | ensure | remove", "Report the PATH entries, add a directory when missing, or drop every copy of it" },
+                            { "which",                  "List every pyrevit.exe on the machine and user PATH; a new terminal runs the first one" },
+                            { "<dir>",                  "Directory to add to or remove from the PATH" },
+                            { "--scope=<scope>",        "PATH to target: user (default) or machine" },
+                            { "--first",                "Make <dir> the first entry of that PATH, so it wins over the other entries of the same scope" },
                         });
                     break;
 
@@ -82,10 +99,13 @@ namespace pyRevitCLI
                             { "<clone_name>",           "Name of this new clone" },
                             { "<deployment_name>",      "Deployment configuration to deploy from" },
                             { "--dest=<dest_path>",     "Clone destination directory" },
-                            { "--source=<image_url>",   "Clone source image url or path" },
+                            { "--branch=<branch_name>", "Branch or release tag to clone from" },
+                            { "--skip-bin",             "Skip downloading pre-built binaries" },
+                            { "--image=<image_url>",    "Clone from a custom image (.zip archive url or path)" },
                             { "--source=<repo_url>",    "Clone source git repo url" },
-                            { "--image=<image_path>",   "Clone from a custom image (.zip archive)" },
-                            { "--branch=<branch_name>", "Branch to clone from" },
+                            { "--username=<username>",  "Username to access private repo. Must be specified with --password" },
+                            { "--password=<password>",  "Password to access private repo. Must be specified with --username" },
+                            { "--token=<auth_token>",   "Access token to access private repo" },
                         });
                     break;
 
@@ -105,7 +125,7 @@ namespace pyRevitCLI
                             { "version",                "Get/Set version of a clone deployed from git repo" },
                             { "commit",                 "Get/Set head commit of a clone deployed from git repo" },
                             { "origin",                 "Get/Set origin of a clone deployed from git repo" },
-                            { "update",                 "Update clone to latest using the original source, deployment, and branch" },
+                            { "update",                 "Update clone to latest using the original source, deployment, and branch (refreshes bin/ from CI unless --skip-bin)" },
                             { "deployments",            "List deployments available in a clone" },
                             { "engines",                "List engines available in a clone" },
                         },
@@ -118,10 +138,13 @@ namespace pyRevitCLI
                             { "<commit_hash>",          "Clone commit rebase to" },
                             { "<origin_url>",           "New clone remote origin url" },
                             { "--force",                "Just do it; I know what I am doing" },
-                            { "--reset",                "Reset remote origin url to default" },
-                            { "--clearconfigs",         "Clear pyRevit configurations." },
                             { "--all",                  "All clones" },
-                            { "--branch",               "Branch to clone from" },
+                            { "--clearconfigs",         "Clear pyRevit configurations." },
+                            { "--reset",                "Reset remote origin url to default" },
+                            { "--skip-bin",             "Skip downloading CI binaries on update" },
+                            { "--username=<username>",  "Username to access private repo. Must be specified with --password" },
+                            { "--password=<password>",  "Password to access private repo. Must be specified with --username" },
+                            { "--token=<auth_token>",   "Access token to access private repo" },
                         });
                     break;
 
@@ -131,10 +154,9 @@ namespace pyRevitCLI
                         header: "Attach pyRevit clone to installed Revit",
                         options: new Dictionary<string, string>() {
                             { "<clone_name>",           "Name of target clone" },
-                            { "<revit_year>",           "Revit version year e.g. 2019" },
-                            { "<engine_version>",       "Engine version to be used e.g. 2711" },
-                            { "latest",                 "Use latest engine" },
-                            { "dynamosafe",             "Use latest engine that is compatible with DynamoBIM" },
+                            { "DEFAULT",                "Use default engine" },
+                            { "<engine_version>",       EngineVersionDescription },
+                            { "<revit_year>",           RevitYearExample },
                             { "--installed",            "All installed Revits" },
                             { "--attached",             "All currently attached Revits" },
                             { "--allusers",             "Attach for all users" },
@@ -146,8 +168,8 @@ namespace pyRevitCLI
                         new List<string>() { "detach" },
                         header: "Detach a clone from Revit.",
                         options: new Dictionary<string, string>() {
-                            { "<revit_year>",           "Revit version year e.g. 2019" },
-                            { "--all",                  "All registered clones" },
+                            { "--all",                  "All attached Revits" },
+                            { "<revit_year>",           RevitYearExample },
                         }
                     );
                     break;
@@ -157,7 +179,7 @@ namespace pyRevitCLI
                         new List<string>() { "attached" },
                         header: "List all attached clones.",
                         options: new Dictionary<string, string>() {
-                            { "<revit_year>",           "Revit version year e.g. 2019" },
+                            { "<revit_year>",           RevitYearExample },
                         }
                     );
                     break;
@@ -168,7 +190,7 @@ namespace pyRevitCLI
                         header: "Quick switch clone of an existing attachment to another.",
                         options: new Dictionary<string, string>() {
                             { "<clone_name>",           "Name of target clone to switch to" },
-                            { "<revit_year>",           "Revit version year e.g. 2019" },
+                            { "<revit_year>",           RevitYearExample },
                         }
                     );
                     break;
@@ -178,13 +200,15 @@ namespace pyRevitCLI
                         new List<string>() { "extend" },
                         header: "Create a clone of a third-party pyRevit extension on this machine",
                         options: new Dictionary<string, string>() {
+                            { "ui | lib",               "Type of custom extension to install" },
                             { "<extension_name>",       "Extension name to install" },
                             { "<repo_url>",             "Extension source git repo url" },
-                            { "ui | lib",               "Type of custom extension to install" },
                             { "--dest=<dest_path>",     "Extension destination directory" },
                             { "--branch=<branch_name>", "Branch to clone from" },
                             { "--username=<username>",  "Username to access private repo. Must be specified with --password" },
-                            { "--password=<password>",  "Password to access private repo. Must be specified with --username" }
+                            { "--password=<password>",  "Password to access private repo. Must be specified with --username" },
+                            { "--token=<auth_token>",   "Access token to access private repo" },
+                            { "--persist-credentials",  "Save credentials to the pyRevit config file (encrypted with Windows DPAPI, readable only by your Windows user) so the extension can be updated later e.g. by the in-Revit extension manager" }
                         }
                     );
                     break;
@@ -210,9 +234,13 @@ namespace pyRevitCLI
                         options: new Dictionary<string, string>() {
                             { "<search_pattern>",       "Search pattern for extension name (regex)" },
                             { "<extension_name>",       "Target extension name" },
+                            { "<clone_name>",           "Name of the clone whose extension to open, enable or disable" },
                             { "<origin_url>",           "New extension remote origin url" },
-                            { "--all",                  "All extension" },
                             { "--reset",                "Reset remote origin url to default" },
+                            { "--all",                  "All extensions" },
+                            { "--username=<username>",  "Username to access private repo. Must be specified with --password" },
+                            { "--password=<password>",  "Password to access private repo. Must be specified with --username" },
+                            { "--token=<auth_token>",   "Access token to access private repo" },
                         }
                     );
                     break;
@@ -226,8 +254,8 @@ namespace pyRevitCLI
                             { "forget",                 "Remove an existing search path" },
                         },
                         options: new Dictionary<string, string>() {
-                            { "<extensions_path>",      "Load-time search path" },
                             { "--all",                  "All extension search paths" },
+                            { "<extensions_path>",      "Load-time search path" },
                         }
                     );
                     break;
@@ -241,8 +269,8 @@ namespace pyRevitCLI
                             { "forget",                 "Remove an existing lookup path" },
                         },
                         options: new Dictionary<string, string>() {
-                            { "<source_json_or_url>",   "Path or url to extension definition json" },
                             { "--all",                  "All extension lookup paths" },
+                            { "<source_json_or_url>",   "Path or url to extension definition json" },
                         }
                     );
                     break;
@@ -257,11 +285,12 @@ namespace pyRevitCLI
                             { "download archive",       "Download Zip archive for given release" }
                         },
                         options: new Dictionary<string, string>() {
+                            { "--pre",                  "Include pre-releases in the search" },
+                            { "--notes",                "Print release notes" },
                             { "latest",                 "Match latest release only" },
                             { "<search_pattern>",       "Pattern to search releases" },
                             { "--dest=<dest_path>",     "Destination file or directory to download to" },
-                            { "--pre",                  "Include pre-releases in the search" },
-                            { "--notes",                "Print release notes" }
+                            { "--admin",                "Download the admin (all users) installer; installer only" }
                         });
                     break;
 
@@ -271,18 +300,18 @@ namespace pyRevitCLI
                         header: "Manage installed and running Revits and addons",
                         commands: new Dictionary<string, string>() {
                             { "killall",                "Kill all running Revits" },
-                            { "fileinfo",               "Delete existing deployment image" },
+                            { "fileinfo",               "Print information about a Revit model file" },
                         },
                         options: new Dictionary<string, string>() {
+                            { "--installed",            "Installed Revits only" },
+                            { "--supported",            "Supported Revits only" },
+                            { "--csv=<output_file>",    "Output csv file path" },
                             { "<revit_year>",           "Target Revit year (major version)" },
                             { "<file_or_dir_path>",     "Target file or directory" },
-                            { "--csv=<output_file>",    "Output csv file path" },
                             { "--rvt",                  "Include Revit Project files (default when not provided)" },
                             { "--rte",                  "Include Revit Project Template files" },
                             { "--rfa",                  "Include Revit Family files" },
                             { "--rft",                  "Include Revit Family Template files" },
-                            { "--installed",            "Installed Revits only" },
-                            { "--supported",            "Supported Revits only" },
                         });
                     break;
 
@@ -290,14 +319,38 @@ namespace pyRevitCLI
                     BuildHelp(
                         new List<string>() { "run" },
                         header: "Run python script in Revit",
+                        commands: new Dictionary<string, string>() {
+                            { "commands",               "List the run command names" },
+                        },
                         options: new Dictionary<string, string>() {
                             { "<script_or_command_name>",
                                                         "Target script path or run command name" },
-                            { "--revit=<revit_year>",   "Target Revit year e.g. 2019" },
-                            { "<model_file>",           "Target Revit model file path" },
+                            { "--revit=<revit_year>",   "Target Revit year e.g. " + RevitProductData.MinimumSupportedProductYear },
+                            { "--inputs=<inputs_json>", "JSON object exposed to the script as JSON text in `__inputs__`" },
+                            { "--inputs-file=<inputs_file>",
+                                                        "Path of a JSON file whose object is exposed to the script as JSON text in `__inputs__`" },
                             { "--purge",                "Remove temporary run environment after completion" },
+                            { "--allowdialogs",         "To allow dialogs during journal playback" },
                             { "--import=<import_path>", "Copy content of this folder into the runtime temp path." },
-                            { "--allowdialogs",         "To allow dialogs during journal playback" }
+                            { "--models=<model_list_file>",
+                                                        "Text file listing the model files to run the script on; requires --revit" },
+                            { "<model_file>",           "Target Revit model file path" },
+                        });
+                    break;
+
+                case PyRevitCLICommandType.Launch:
+                    BuildHelp(
+                        new List<string>() { "launch" },
+                        header: "Start Revit on a pyRevit clone and engine without changing the attachment.\n"
+                                + "The command stays running while Revit runs and removes its temporary files when Revit exits.",
+                        options: new Dictionary<string, string>() {
+                            { "<clone_name_or_path>",   "Name of a registered clone, or the path of a clone" },
+                            { "DEFAULT",                "Use default engine" },
+                            { "<engine_version>",       EngineVersionDescription },
+                            { "<revit_year>",           RevitYearExample },
+                            { "<model_file>",           "Model file Revit opens once it has started" },
+                            { "--isolated",             "Give the session its own pyRevit config folder, seeded with a copy of the current config" },
+                            { "--language=<code>",      "Revit UI language code e.g. ENU" },
                         });
                     break;
 
@@ -309,8 +362,9 @@ namespace pyRevitCLI
                             { "clear",                  "Clear existing pyRevit caches" },
                         },
                         options: new Dictionary<string, string>() {
+                            { "bim360",                 "Clear the BIM360 caches instead of the pyRevit caches" },
                             { "--all",                  "All Revit version caches" },
-                            { "<revit_year>",           "Caches for specific Revit version year e.g. 2019" },
+                            { "<revit_year>",           "Caches for specific Revit version year e.g. " + RevitProductData.MinimumSupportedProductYear },
                         });
                     break;
 
@@ -319,7 +373,61 @@ namespace pyRevitCLI
                         new List<string>() { "config" },
                         header: "Configure pyRevit for current user from existing configuration file",
                         options: new Dictionary<string, string>() {
-                            { "<template_config_path>", "Existing config file" },
+                            { "--from=<template_config_path>",
+                                                        "Existing config file" },
+                        });
+                    break;
+
+                case PyRevitCLICommandType.Agent:
+                    BuildHelp(
+                        new List<string>() { "agent" },
+                        header: "Talk to running Revit sessions through the pyRevit agent host",
+                        commands: new Dictionary<string, string>() {
+                            { "status",                 "List running Revit sessions with the agent host" },
+                            { "context",                "Print the context of a Revit session (document, view, selection...)" },
+                            { "run",                    "Run a Python script in Revit through the agent host" },
+                            { "runs",                   "List recent agent runs" },
+                            { "show",                   "Print the record of an agent run" },
+                            { "record",                 "Start, stop or check a session recording of what happens in Revit" },
+                            { "recordings",             "List recent session recordings" },
+                        },
+                        options: new Dictionary<string, string>() {
+                            { "--json",                 "Print status as json" },
+                            { "<script_file>",          "Python script to run" },
+                            { "--mode=<run_mode>",      "query (default), dry_run or modify" },
+                            { "--engine=<engine_name>", "ironpython or cpython (default: configured agent engine)" },
+                            { "--title=<run_title>",    "Run title; used as the undo name for modify runs" },
+                            { "--inputs=<inputs_json>", "JSON object exposed to the script as `inputs`" },
+                            { "--revit=<revit_year>",   "Target Revit year, process id or clone name when several are running" },
+                            { "--timeout=<seconds>",    "Stop the script after this many seconds (default 300, max 3600)" },
+                            { "--workspace=<folder>",   "Folder of your own modules to put on sys.path for the run" },
+                            { "--limit=<count>",        "Number of runs to list (default 20)" },
+                            { "<run_id>",               "Run id printed by 'agent run' or 'agent runs', or the request id (req-...) of a request that got no answer" },
+                            { "<action>",               "start, stop or status, for 'agent record'" },
+                            { "--no-screenshots",       "Record without screenshots" },
+                            { "--screenshot-interval=<seconds>", "Minimum seconds between screenshots (default 5)" },
+                            { "--max-screenshots=<count>", "Most screenshots in one recording (default 20, max 100)" },
+                            { "--max-events=<count>",   "Most events in one recording (default 5000, max 20000)" },
+                            { "--max-duration=<seconds>", "Stop the recording after this long (default 1800, max 14400)" },
+                        });
+                    break;
+
+                case PyRevitCLICommandType.Mcp:
+                    BuildHelp(
+                        new List<string>() { "mcp" },
+                        header: "Run the pyRevit MCP server over stdio, or register it with an MCP client",
+                        commands: new Dictionary<string, string>() {
+                            { "install",                "Register 'pyrevit mcp' with an MCP client" },
+                            { "uninstall",              "Remove 'pyrevit mcp' from an MCP client" },
+                        },
+                        options: new Dictionary<string, string>() {
+                            { "--revit=<revit_year>",   "Default target Revit year, process id or clone name for the server" },
+                            { "claude | codex",         "Claude Code, OpenAI Codex (configured through their CLIs)" },
+                            { "cursor | vscode",        "Cursor, Visual Studio Code (configured through mcp.json)" },
+                            { "opencode",               "OpenCode (configured through opencode.json / opencode.jsonc)" },
+                            { "--project",              "Register for the current directory instead of the user" },
+                            { "--all",                  "Remove 'pyrevit mcp' from the user-level config of every MCP client" },
+                            { "--owned",                "With --all, keep registrations that point to another pyrevit.exe" },
                         });
                     break;
 
@@ -329,19 +437,20 @@ namespace pyRevitCLI
                         header: "Manage pyRevit configurations",
                         mgmtCommands: new Dictionary<string, string>() {
                             { "seed",                   "Seed existing configuration file to %PROGRAMDATA%" },
+                            { "seedshippeddefaults",    "Write disabled flags for shipped extensions with default_enabled=False" },
                             { "routes",                 "Routes configurations" },
+                            { "agent",                  "Agent host configurations (enable, policy, default engine, user skills, reckless runs)" },
                             { "telemetry",              "Script Telemetry configurations" },
                             { "apptelemetry",           "Application Telemetry configurations" },
                         },
                         commands: new Dictionary<string, string>() {
                             { "bincache",               "Enable/Disable binary cache for caching extension info" },
-                            { "allowremotedll",         "Allow loading remote dlls" },
                             { "checkupdates",           "Check updates on startup (for git clones only)" },
                             { "autoupdate",             "Auto update on startup (for git clones only)" },
                             { "rocketmode",             "Rocket mode" },
                             { "logs",                   "Debug logging (reporting) levels" },
                             { "filelogging",            "Debug file logging (slows down the load process)" },
-                            { "startuptimeout",         "Starup log window timeout" },
+                            { "startuptimeout",         "Startup log window timeout" },
                             { "loadbeta",               "Load beta tools" },
                             { "cpyversion",             "CPython engine version" },
                             { "usercanupdate",          "Enable/Disable Update button in pyRevit" },
@@ -354,7 +463,7 @@ namespace pyRevitCLI
                         options: new Dictionary<string, string>() {
                             { "none | verbose | debug", "Debug log levels" },
                             { "enable | disable",       "Enable/Disable config option" },
-                            { "Yes | No",               "Activate/Deactivate config option" },
+                            { "yes | no",               "Activate/Deactivate config option" },
                             { "file | server",          "Set path for file logging, or url for server logging" },
                             { "hooks",                  "Activate/Deactivate telemetry for hooks" },
                             { "<css_path>",             "Target css file path for output styling" },
@@ -378,7 +487,7 @@ namespace pyRevitCLI
                                       IDictionary<string, string> helpCommands = null,
                                       IDictionary<string, string> options = null) {
             // print commands help
-            int indent = 25;
+            int indent = Math.Max(25, LongestKeyLength(mgmtCommands, commands, helpCommands, options) + 1);
             string outputFormat = "        {0,-" + indent.ToString() + "}{1}";
 
             var helpString = "";
@@ -442,6 +551,15 @@ namespace pyRevitCLI
                 helpString += footer + Environment.NewLine;
 
             Console.WriteLine(helpString);
+        }
+
+        private static int LongestKeyLength(params IDictionary<string, string>[] sections) {
+            return sections
+                .Where(section => section != null)
+                .SelectMany(section => section.Keys)
+                .Select(key => key.Length)
+                .DefaultIfEmpty(0)
+                .Max();
         }
 
         private static string BuildOptions(string baseHelp, string header, IDictionary<string, string> options, string outputFormat) {

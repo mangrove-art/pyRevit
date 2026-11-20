@@ -15,13 +15,9 @@ namespace PyRevitLabs.PyRevit.Runtime {
         }
 
         public override int Execute(ref ScriptRuntime runtime) {
-#if (REVIT2013 || REVIT2014)
-            TaskDialog.Show(PyRevitLabsConsts.ProductName, NotSupportedFeatureException.NotSupportedMessage);
-            return ScriptExecutorResultCodes.NotSupportedFeatureException;
-#else
-            if (runtime.UIApp != null && runtime.UIApp.ActiveUIDocument != null) {
+            UIDocument uidoc = runtime.ActiveUIDocument;
+            if (uidoc != null) {
                 string familySourceFile = runtime.ScriptSourceFile;
-                UIDocument uidoc = runtime.UIApp.ActiveUIDocument;
                 Document doc = uidoc.Document;
 
                 // find or load family first
@@ -41,14 +37,15 @@ namespace PyRevitLabs.PyRevit.Runtime {
                 // if not found, attemt to load
                 if (contentFamily == null) {
                     try {
-                        var txn = new Transaction(doc, "Load pyRevit Content");
-                        txn.Start();
-                        doc.LoadFamily(
-                            familySourceFile,
-                            new ContentLoaderOptions(),
-                            out contentFamily
-                            );
-                        txn.Commit();
+                        using (var txn = new Transaction(doc, "Load pyRevit Content")) {
+                            txn.Start();
+                            doc.LoadFamily(
+                                familySourceFile,
+                                new ContentLoaderOptions(),
+                                out contentFamily
+                                );
+                            txn.Commit();
+                        }
                     }
                     catch (Exception loadEx) {
                         var dialog = new TaskDialog(PyRevitLabsConsts.ProductName);
@@ -91,7 +88,6 @@ namespace PyRevitLabs.PyRevit.Runtime {
 
             TaskDialog.Show(PyRevitLabsConsts.ProductName, "Failed accessing Application.");
             return ScriptExecutorResultCodes.FailedLoadingContent;
-#endif
         }
     }
 
@@ -101,8 +97,14 @@ namespace PyRevitLabs.PyRevit.Runtime {
             return overwriteParameterValues;
         }
 
+        /// <summary>
+        /// Loads the shared family from the bundle's own family file and overwrites its parameter values,
+        /// matching <see cref="OnFamilyFound"/>.
+        /// </summary>
         public bool OnSharedFamilyFound(Family sharedFamily, bool familyInUse, out FamilySource source, out bool overwriteParameterValues) {
-            throw new NotImplementedException();
+            source = FamilySource.Family;
+            overwriteParameterValues = true;
+            return true;
         }
     }
 }

@@ -10,49 +10,44 @@ Examples:
     from pyrevit import script
     output = script.get_output()
     ```
-
-Here is the source of :func:`pyrevit.script.get_output`. As you can see this
-functions calls the :func:`pyrevit.output.get_output` to receive the
-output wrapper.
-
-.. literalinclude:: ../../pyrevitlib/pyrevit/script.py
-    :pyobject: get_output
 """
 
-from __future__ import print_function
+import functools
+import json
 import os.path as op
-import itertools
 
-from pyrevit import HOST_APP, EXEC_PARAMS
+from pyrevit import HOST_APP, EXEC_PARAMS, DB
 from pyrevit import framework
-from pyrevit import coreutils
-from pyrevit.coreutils import logger
-from pyrevit.coreutils import markdown, charts
+from pyrevit.compat import IRONPY, PY3, safe_strtype
 from pyrevit.coreutils import envvars
-from pyrevit.runtime.types import ScriptConsoleManager
-from pyrevit.output import linkmaker
+from pyrevit.coreutils import charts
+from pyrevit.coreutils.logger import get_logger
+from pyrevit.runtime.types import ScriptConsoleManager, ScriptOutput
 from pyrevit.userconfig import user_config
-from pyrevit import DB
+from pyrevit.output import linkmaker
+from pyrevit import coreutils
+
+if PY3:
+    from urllib.parse import quote as urlquote
+else:
+    from urllib import quote as urlquote
 
 
-#pylint: disable=W0703,C0302,C0103
-mlogger = logger.get_logger(__name__)
+mlogger = get_logger(__name__)
+
+DEFAULT_STYLESHEET_NAME = "outputstyles.css"
 
 
-DEFAULT_STYLESHEET_NAME = 'outputstyles.css'
-
-
-def docclosing_eventhandler(sender, args):  #pylint: disable=W0613
-    """Close all output window on document closing."""
+def docclosing_eventhandler(sender, args):
+    """Close all output windows on document closing."""
     ScriptConsoleManager.CloseActiveOutputWindows()
 
 
 def setup_output_closer():
     """Setup document closing event listener."""
-    HOST_APP.app.DocumentClosing += \
-        framework.EventHandler[DB.Events.DocumentClosingEventArgs](
-            docclosing_eventhandler
-            )
+    HOST_APP.app.DocumentClosing += framework.EventHandler[
+        DB.Events.DocumentClosingEventArgs
+    ](docclosing_eventhandler)
 
 
 def set_stylesheet(stylesheet):
@@ -62,11 +57,7 @@ def set_stylesheet(stylesheet):
         stylesheet (str): full path to stylesheet file
     """
     if op.isfile(stylesheet):
-        envvars.set_pyrevit_env_var(envvars.OUTPUT_STYLESHEET_ENVVAR,
-                                    stylesheet)
-        # do not store this setting forcefully
-        # each repo should default to its own stylesheet
-        # user_config.output_stylesheet = stylesheet
+        envvars.set_pyrevit_env_var(envvars.OUTPUT_STYLESHEET_ENVVAR, stylesheet)
 
 
 def get_stylesheet():
@@ -81,8 +72,9 @@ def get_default_stylesheet():
 
 def reset_stylesheet():
     """Reset active stylesheet to default."""
-    envvars.set_pyrevit_env_var(envvars.OUTPUT_STYLESHEET_ENVVAR,
-                                get_default_stylesheet())
+    envvars.set_pyrevit_env_var(
+        envvars.OUTPUT_STYLESHEET_ENVVAR, get_default_stylesheet()
+    )
 
 
 # setup output window stylesheet
@@ -90,23 +82,108 @@ active_stylesheet = user_config.output_stylesheet or get_default_stylesheet()
 set_stylesheet(active_stylesheet)
 
 
+def _command_runtime_output():
+    """Return the ``ScriptOutput`` of the running command.
+
+    Outside of a command (e.g. during session load) falls back to the session
+    output.
+    """
+    out = None
+    runtime = EXEC_PARAMS.script_runtime
+    if runtime:
+        out = getattr(runtime, "OutputService", None)
+    if out is None:
+        out = ScriptOutput.GetDefault()
+    return out
+
+
 class PyRevitOutputWindow(object):
-    """Wrapper to interact with the output window."""
+    """Wrapper to interact with the output window.
+
+    The output window is an html-rendering console that scripts print to. This
+    wrapper exposes the documented Python API for it: printing (html, markdown,
+    code, tables, images), drawing charts, managing window geometry and icon,
+    driving the progress bar and log panel, and saving the rendered contents.
+
+    Each wrapper binds at construction to one ``ScriptOutput``: the running
+    command's own window, or the shared session window when no command is
+    running (e.g. session load). The binding is cached for the wrapper's
+    lifetime, so retaining the wrapper also retains the correct output for
+    deferred and modeless callbacks after the command returns.
+
+    Members not listed here are forwarded to the underlying ``ScriptOutput``
+    .NET object.
+
+    Examples:
+        ```python
+        from pyrevit import script
+        output = script.get_output()
+        output.set_title('My Report')
+        output.print_md('### Results')
+        for i in range(10):
+            output.update_progress(i + 1, 10)
+        ```
+    """
+
+    def __init__(self):
+        # Deferred callbacks must retain the command output selected while the
+        # command runtime is still active.
+        output = self._runtime_output()
+        object.__setattr__(
+            self, "linkify", functools.partial(self.linkify, output=output)
+        )
+
+    def _runtime_output(self):
+        """Return the runtime ``ScriptOutput`` this wrapper is bound to.
+
+        The binding is resolved during wrapper construction and reused for the
+        wrapper's lifetime.
+        """
+        out = self.__dict__.get("_rt_out")
+        if out is None:
+            out = _command_runtime_output()
+            object.__setattr__(self, "_rt_out", out)
+        return out
+
+    def __getattr__(self, name):
+        """Forward unknown attribute reads to the bound ``ScriptOutput``."""
+        return getattr(self._runtime_output(), name)
+
+    def __setattr__(self, name, value):
+        """Forward attribute writes to the bound ``ScriptOutput``.
+
+        Private (``_``-prefixed) names and anything the runtime object rejects
+        are stored on the wrapper instead.
+        """
+        if name.startswith("_"):
+            object.__setattr__(self, name, value)
+            return
+
+        try:
+            setattr(self._runtime_output(), name, value)
+        except Exception:
+            object.__setattr__(self, name, value)
 
     @property
     def window(self):
         """``PyRevitLabs.PyRevit.Runtime.ScriptConsole``: Return output window object."""
-        return EXEC_PARAMS.window_handle
+        return self._runtime_output().window
 
     @property
     def renderer(self):
-        """Return html renderer inside output window.
+        """Raise: the legacy IE ``WebBrowser`` renderer was removed.
 
-        Returns:
-            (System.Windows.Forms.WebBrowser): HTML renderer
+        The output window now renders with Microsoft Edge WebView2 (Chromium).
+        There is no live DOM object to reach for; use :func:`inject_to_head`,
+        :func:`inject_to_body`, :func:`inject_script`, :func:`add_style`, and
+        :func:`print_html` instead.
         """
-        if self.window:
-            return self.window.renderer
+        raise NotImplementedError(
+            "output.renderer (System.Windows.Forms.WebBrowser) was removed. "
+            "The output window renders with WebView2 (Chromium) now and does "
+            "not expose a browser control. Use inject_to_head, "
+            "inject_to_body, inject_script, add_style, or print_html."
+        )
 
     @property
     def output_id(self):
@@ -117,8 +194,7 @@ class PyRevitOutputWindow(object):
         output windows belonging to the same pyRevit command, will have
         identical output_id values.
         """
-        if self.window:
-            return self.window.OutputId
+        return self._runtime_output().output_id
 
     @property
     def output_uniqueid(self):
@@ -128,18 +204,17 @@ class PyRevitOutputWindow(object):
         generated when the output window is opened. This id is unique to the
         instance of output window.
         """
-        if self.window:
-            return self.window.OutputUniqueId
+        return self._runtime_output().output_uniqueid
 
     @property
     def is_closed_by_user(self):
         """Whether the window has been closed by the user."""
-        return self.window.ClosedByUser
+        return self._runtime_output().is_closed_by_user
 
     @property
     def last_line(self):
         """Last line of the output window."""
-        return self.window.GetLastLine()
+        return self._runtime_output().last_line
 
     @property
     def debug_mode(self):
@@ -148,17 +223,11 @@ class PyRevitOutputWindow(object):
         This will cause the output window to print information about the
         buffer stream and other aspects of the output window mechanism.
         """
-        return EXEC_PARAMS.output_stream.PrintDebugInfo
+        return self._runtime_output().debug_mode
 
     @debug_mode.setter
     def debug_mode(self, value):
-        EXEC_PARAMS.output_stream.PrintDebugInfo = value
-
-    def _get_head_element(self):
-        return self.renderer.Document.GetElementsByTagName('head')[0]
-
-    def _get_body_element(self):
-        return self.renderer.Document.GetElementsByTagName('body')[0]
+        self._runtime_output().debug_mode = value
 
     def self_destruct(self, seconds):
         """Set self-destruct (close window) timer.
@@ -166,8 +235,7 @@ class PyRevitOutputWindow(object):
         Args:
             seconds (int): number of seconds after which window is closed.
         """
-        if self.window:
-            self.window.SelfDestructTimer(seconds)
+        return self._runtime_output().self_destruct(seconds)
 
     def inject_to_head(self, element_tag, element_contents, attribs=None):
         """Inject html element to current html head of the output window.
@@ -185,19 +253,9 @@ class PyRevitOutputWindow(object):
                                   {'src': js_script_file_path})
             ```
         """
-        html_element = self.renderer.Document.CreateElement(element_tag)
-        if element_contents:
-            html_element.InnerHtml = element_contents
-
-        if attribs:
-            for attribute, value in attribs.items():
-                html_element.SetAttribute(attribute, value)
-
-        # inject the script into head
-        head_el = self._get_head_element()
-        head_el.AppendChild(html_element)
-        if self.window:
-            self.window.WaitReadyBrowser()
+        return self._runtime_output().inject_to_head(
+            element_tag, element_contents, attribs
+        )
 
     def inject_to_body(self, element_tag, element_contents, attribs=None):
         """Inject html element to current html body of the output window.
@@ -215,19 +273,9 @@ class PyRevitOutputWindow(object):
                                   {'src': js_script_file_path})
             ```
         """
-        html_element = self.renderer.Document.CreateElement(element_tag)
-        if element_contents:
-            html_element.InnerHtml = element_contents
-
-        if attribs:
-            for attribute, value in attribs.items():
-                html_element.SetAttribute(attribute, value)
-
-        # inject the script into body
-        body_el = self._get_body_element()
-        body_el.AppendChild(html_element)
-        if self.window:
-            self.window.WaitReadyBrowser()
+        return self._runtime_output().inject_to_body(
+            element_tag, element_contents, attribs
+        )
 
     def inject_script(self, script_code, attribs=None, body=False):
         """Inject script tag into current head (or body) of the output window.
@@ -244,10 +292,7 @@ class PyRevitOutputWindow(object):
                                  {'src': js_script_file_path})
             ```
         """
-        if body:
-            self.inject_to_body('script', script_code, attribs=attribs)
-        else:
-            self.inject_to_head('script', script_code, attribs=attribs)
+        return self._runtime_output().inject_script(script_code, attribs, body)
 
     def add_style(self, style_code, attribs=None):
         """Inject style tag into current html head of the output window.
@@ -262,26 +307,23 @@ class PyRevitOutputWindow(object):
             output.add_style('body { color: blue; }')
             ```
         """
-        self.inject_to_head('style', style_code, attribs=attribs)
+        return self._runtime_output().add_style(style_code, attribs)
 
     def get_head_html(self):
         """str: Return inner code of html head element."""
-        return self._get_head_element().InnerHtml
+        return self._runtime_output().get_head_html()
 
     def set_title(self, new_title):
         """Set window title to the new title."""
-        if self.window:
-            self.window.Title = new_title
+        return self._runtime_output().set_title(new_title)
 
     def set_width(self, width):
         """Set window width to the new width."""
-        if self.window:
-            self.window.Width = width
+        return self._runtime_output().set_width(width)
 
     def set_height(self, height):
         """Set window height to the new height."""
-        if self.window:
-            self.window.Height = height
+        return self._runtime_output().set_height(height)
 
     def set_font(self, font_family, font_size):
         """Set window font family to the new font family and size.
@@ -290,48 +332,31 @@ class PyRevitOutputWindow(object):
             font_family (str): font family name e.g. 'Courier New'
             font_size (int): font size e.g. 16
         """
-        self.renderer.Font = \
-            framework.Drawing.Font(font_family,
-                                   font_size,
-                                   framework.Drawing.FontStyle.Regular,
-                                   framework.Drawing.GraphicsUnit.Point)
+        return self._runtime_output().set_font(font_family, font_size)
 
     def resize(self, width, height):
         """Resize window to the new width and height."""
-        self.set_width(width)
-        self.set_height(height)
+        return self._runtime_output().resize(width, height)
 
     def center(self):
         """Center the output window on the screen."""
-        screen_area = HOST_APP.proc_screen_workarea
-        left = \
-            (abs(screen_area.Right - screen_area.Left) / 2) \
-                - (self.get_width() / 2)
-        top = \
-            (abs(screen_area.Top - screen_area.Bottom) / 2) \
-                - (self.get_height() / 2)
-        self.window.Left = left
-        self.window.Top = top
+        return self._runtime_output().center()
 
     def get_title(self):
         """str: Return current window title."""
-        if self.window:
-            return self.window.Text
+        return self._runtime_output().get_title()
 
     def get_width(self):
         """int: Return current window width."""
-        if self.window:
-            return self.window.Width
+        return self._runtime_output().get_width()
 
     def get_height(self):
         """int: Return current window height."""
-        if self.window:
-            return self.window.Height
+        return self._runtime_output().get_height()
 
     def close(self):
         """Close the window."""
-        if self.window:
-            self.window.Close()
+        return self._runtime_output().close()
 
     def close_others(self, all_open_outputs=False):
         """Close all other windows that belong to the current command.
@@ -339,41 +364,31 @@ class PyRevitOutputWindow(object):
         Args:
             all_open_outputs (bool): Close all any other windows if True
         """
-        if all_open_outputs:
-            ScriptConsoleManager.CloseActiveOutputWindows(self.window)
-        else:
-            ScriptConsoleManager.CloseActiveOutputWindows(self.window,
-                                                         self.output_id)
+        return self._runtime_output().close_others(all_open_outputs)
 
     def hide(self):
         """Hide the window."""
-        if self.window:
-            self.window.Hide()
+        return self._runtime_output().hide()
 
     def show(self):
         """Show the window."""
-        if self.window:
-            self.window.Show()
+        return self._runtime_output().show()
 
     def lock_size(self):
         """Lock window size."""
-        if self.window:
-            self.window.LockSize()
+        return self._runtime_output().lock_size()
 
     def unlock_size(self):
-        """Unock window size."""
-        if self.window:
-            self.window.UnlockSize()
+        """Unlock window size."""
+        return self._runtime_output().unlock_size()
 
     def freeze(self):
         """Freeze output content update."""
-        if self.window:
-            self.window.Freeze()
+        return self._runtime_output().freeze()
 
     def unfreeze(self):
         """Unfreeze output content update."""
-        if self.window:
-            self.window.Unfreeze()
+        return self._runtime_output().unfreeze()
 
     def save_contents(self, dest_file):
         """Save html code of the window.
@@ -381,13 +396,7 @@ class PyRevitOutputWindow(object):
         Args:
             dest_file (str): full path of the destination html file
         """
-        if self.renderer:
-            html = \
-                self.renderer.Document.Body.OuterHtml.encode('ascii', 'ignore')
-            doc_txt = self.renderer.DocumentText
-            full_html = doc_txt.lower().replace('<body></body>', html)
-            with open(dest_file, 'w') as output_file:
-                output_file.write(full_html)
+        return self._runtime_output().save_contents(dest_file)
 
     def open_url(self, dest_url):
         """Open url page in output window.
@@ -395,8 +404,7 @@ class PyRevitOutputWindow(object):
         Args:
             dest_url (str): web url of the target page
         """
-        if self.renderer:
-            self.renderer.Navigate(dest_url, False)
+        return self._runtime_output().open_url(dest_url)
 
     def open_page(self, dest_file):
         """Open html page in output window.
@@ -404,8 +412,130 @@ class PyRevitOutputWindow(object):
         Args:
             dest_file (str): full path of the target html file
         """
-        self.show()
-        self.open_url('file:///' + dest_file)
+        return self._runtime_output().open_page(dest_file)
+
+    @property
+    def supports_messages(self):
+        """bool: Whether the page can exchange messages with Python.
+
+        False when the window falls back to plain text (e.g. the WebView2
+        runtime is missing) or has been closed by the user. Scripts should
+        check this and fall back to a printed report.
+
+        Note:
+            Opens the output window and starts its renderer if needed, without
+            waiting for it, but never reopens a window the user closed.
+        """
+        runtime_output = self._runtime_output()
+        if runtime_output.IsWindowClosed:
+            return False
+        return runtime_output.window.SupportsWebMessages
+
+    def on_message(self, handler):
+        """Register a handler for messages the output page posts to Python.
+
+        The page sends with ``window.chrome.webview.postMessage(value)``. The
+        handler receives the JSON-decoded value (``dict`` for a posted object)
+        and runs in Revit API context through
+        :func:`pyrevit.revit.events.execute_in_revit_context`, one call per
+        message in arrival order. Return values are ignored; answer with
+        :func:`post_message`. Handlers are released when the window closes.
+
+        Warning:
+            ``execute_in_revit_context`` is IronPython-only. Under CPython
+            handlers run directly on the UI thread, outside Revit API
+            context, so they can update the page but cannot read or modify
+            the model.
+
+        Args:
+            handler (function): ``handler(message)``; a plain function or
+                method, as required by ``execute_in_revit_context``
+
+        Returns:
+            (bool): False when the window cannot receive messages; see
+            :attr:`supports_messages`.
+
+        Important:
+            Handlers outlive the command, so the bundle must run on a
+            persistent engine (``engine: persistent`` in ``bundle.yaml``).
+
+        Examples:
+            ```python
+            output = script.get_output()
+
+            def select_elements(message):
+                revit.get_selection().set_to(message["ids"])
+
+            if output.on_message(select_elements):
+                output.print_html(
+                    '<button onclick="chrome.webview.postMessage('
+                    '{ids: [1234]})">Select</button>'
+                )
+            else:
+                output.print_md("Interactive actions need the WebView2 runtime.")
+            ```
+        """
+        if not self.supports_messages:
+            return False
+        window = self._runtime_output().window
+        if self.__dict__.get("_message_window") != window:
+            self._message_handlers = []
+            subscription = self.__dict__.setdefault(
+                "_message_subscription", self._dispatch_message
+            )
+            window.WebMessageReceived += subscription
+            self._message_window = window
+        handlers = self._message_handlers
+        if handler not in handlers:
+            handlers.append(handler)
+        return True
+
+    def off_message(self, handler):
+        """Unregister a handler added with :func:`on_message`."""
+        handlers = self.__dict__.get("_message_handlers", [])
+        if handler in handlers:
+            handlers.remove(handler)
+
+    def post_message(self, data):
+        """Send a JSON-serializable value to the page.
+
+        The page receives it as the ``data`` of a ``message`` event:
+        ``chrome.webview.addEventListener("message", e => e.data)``.
+
+        Args:
+            data (object): value to serialize with ``json.dumps``. Non-ASCII
+                text is sent as is, not escaped as unicode sequences, because
+                IronPython 2's ASCII-escaping encoder raises on some mixed
+                Cyrillic and Latin-1 strings.
+
+        Returns:
+            (bool): False when the window is closed or cannot deliver messages,
+            including while the page is loading or navigating (e.g. right
+            after :func:`open_page`).
+        """
+        if not self._runtime_output().IsWindowReady:
+            return False
+        return self._runtime_output().window.PostWebMessage(
+            json.dumps(data, ensure_ascii=False)
+        )
+
+    def _dispatch_message(self, sender, args):
+        """Decode one page message and schedule every handler in API context."""
+        from pyrevit.revit import events
+
+        try:
+            message = json.loads(args.Json)
+        except ValueError:
+            mlogger.debug("Ignoring output page message that is not valid JSON")
+            return
+        for handler in list(self.__dict__.get("_message_handlers", [])):
+            if IRONPY:
+                events.execute_in_revit_context(handler, message)
+                continue
+            try:
+                handler(message)
+            except Exception as ex:
+                mlogger.error("Output message handler failed: {}".format(ex))
 
     def update_progress(self, cur_value, max_value):
         """Activate and update the output window progress bar.
@@ -421,82 +551,61 @@ class PyRevitOutputWindow(object):
                 output.update_progress(i, 100)
             ```
         """
-        if self.window:
-            self.window.UpdateActivityBar(cur_value, max_value)
+        return self._runtime_output().update_progress(cur_value, max_value)
 
     def reset_progress(self):
         """Reset output window progress bar to zero."""
-        if self.window:
-            self.window.UpdateActivityBar(0, 1)
+        return self._runtime_output().reset_progress()
 
     def hide_progress(self):
         """Hide output window progress bar."""
-        if self.window:
-            self.window.SetActivityBarVisibility(False)
+        return self._runtime_output().hide_progress()
 
     def unhide_progress(self):
         """Unhide output window progress bar."""
-        if self.window:
-            self.window.SetActivityBarVisibility(True)
+        return self._runtime_output().unhide_progress()
 
     def indeterminate_progress(self, state):
         """Show or hide indeterminate progress bar."""
-        if self.window:
-            self.window.UpdateActivityBar(state)
+        return self._runtime_output().indeterminate_progress(state)
 
     def show_logpanel(self):
         """Show output window logging panel."""
-        if self.window:
-            self.window.SetActivityBarVisibility(True)
+        return self._runtime_output().show_logpanel()
 
     def hide_logpanel(self):
         """Hide output window logging panel."""
-        if self.window:
-            self.show_logpanel()
-            self.window.SetActivityBarVisibility(False)
+        return self._runtime_output().hide_logpanel()
 
     def log_debug(self, message):
         """Report DEBUG message into output logging panel."""
-        if self.window:
-            self.show_logpanel()
-            self.window.activityBar.ConsoleLog(message)
+        return self._runtime_output().log_debug(safe_strtype(message))
 
     def log_success(self, message):
         """Report SUCCESS message into output logging panel."""
-        if self.window:
-            self.show_logpanel()
-            self.window.activityBar.ConsoleLogOK(message)
+        return self._runtime_output().log_success(safe_strtype(message))
 
     def log_info(self, message):
         """Report INFO message into output logging panel."""
-        if self.window:
-            self.show_logpanel()
-            self.window.activityBar.ConsoleLogInfo(message)
+        return self._runtime_output().log_info(safe_strtype(message))
 
     def log_warning(self, message):
         """Report WARNING message into output logging panel."""
-        if self.window:
-            self.show_logpanel()
-            self.window.activityBar.ConsoleLogWarning(message)
+        return self._runtime_output().log_warning(safe_strtype(message))
 
     def log_error(self, message):
         """Report ERROR message into output logging panel."""
-        if self.window:
-            self.show_logpanel()
-            self.window.activityBar.ConsoleLogError(message)
+        return self._runtime_output().log_error(safe_strtype(message))
 
     def set_icon(self, iconpath):
         """Sets icon on the output window."""
-        if self.window:
-            self.window.SetIcon(iconpath)
+        return self._runtime_output().set_icon(iconpath)
 
     def reset_icon(self):
-        """Sets icon on the output window."""
-        if self.window:
-            self.window.ResetIcon()
+        """Resets the output window icon to the default."""
+        return self._runtime_output().reset_icon()
 
-    @staticmethod
-    def print_html(html_str):
+    def print_html(self, html_str):
         """Add the html code to the output window.
 
         Examples:
@@ -505,11 +614,9 @@ class PyRevitOutputWindow(object):
             output.print_html('<strong>Title</strong>')
             ```
         """
-        print(coreutils.prepare_html_str(html_str),
-              end="")
+        return self._runtime_output().print_html(safe_strtype(html_str))
 
-    @staticmethod
-    def print_code(code_str):
+    def print_code(self, code_str):
         """Print code to the output window with special formatting.
 
         Examples:
@@ -518,18 +625,9 @@ class PyRevitOutputWindow(object):
             output.print_code('value = 12')
             ```
         """
-        code_div = '<div class="code">{}</div>'
-        print(
-            coreutils.prepare_html_str(
-                code_div.format(
-                    code_str.replace('    ', '&nbsp;'*4)
-                    )
-                ),
-            end=""
-            )
+        return self._runtime_output().print_code(safe_strtype(code_str))
 
-    @staticmethod
-    def print_md(md_str):
+    def print_md(self, md_str):
         """Process markdown code and print to output window.
 
         Examples:
@@ -538,14 +636,11 @@ class PyRevitOutputWindow(object):
             output.print_md('### Title')
             ```
         """
-        tables_ext = 'pyrevit.coreutils.markdown.extensions.tables'
-        markdown_html = markdown.markdown(md_str, extensions=[tables_ext])
-        markdown_html = markdown_html.replace('\n', '').replace('\r', '')
-        html_code = coreutils.prepare_html_str(markdown_html)
-        print(html_code, end="")
+        return self._runtime_output().print_md(safe_strtype(md_str))
 
-    def print_table(self, table_data, columns=None, formats=None,
-                    title='', last_line_style=''):
+    def print_table(
+        self, table_data, columns=None, formats=None, title="", last_line_style=""
+    ):
         """Print provided data in a table in output window.
 
         Args:
@@ -570,53 +665,76 @@ class PyRevitOutputWindow(object):
             )
             ```
         """
-        if not columns:
-            columns = []
-        if not formats:
-            formats = []
+        return self._runtime_output().print_table(
+            table_data, columns, formats, title, last_line_style
+        )
 
-        if last_line_style:
-            self.add_style('tr:last-child {{ {style} }}'
-                           .format(style=last_line_style))
+    def print_html_table(
+        self,
+        table_data,
+        columns=None,
+        formats=None,
+        title="",
+        last_line_style="",
+        **kwargs
+    ):
+        """Print provided data in a HTML table in output window.
 
-        zipper = itertools.izip_longest #pylint: disable=E1101
-        adjust_base_col = '|'
-        adjust_extra_col = ':---|'
-        base_col = '|'
-        extra_col = '{data}|'
+        The same window can output several tables, each with their own
+        formatting options.
 
-        # find max column count
-        max_col = max([len(x) for x in table_data])
+        Args:
+            table_data (list[iterable[Any]]): 2D array of data
+            title (str): table title
+            columns (list[str]): list of column names
+            formats (list[str]): column data formats using python string formatting
+            last_line_style (str): css style of last row of data (NB applies to all tables in this output)
+            **kwargs: extra formatting options:
 
-        header = ''
-        if columns:
-            header = base_col
-            for idx, col_name in zipper(range(max_col), columns, fillvalue=''): #pylint: disable=W0612
-                header += extra_col.format(data=col_name)
+                - column_head_align_styles (list[str]): css align-text styles for header row
+                - column_data_align_styles (list[str]): css align-text styles for data rows
+                - column_widths (list[str]): list of CSS widths in either px or %
+                - column_vertical_border_style (str): CSS compact border definition
+                - table_width_style (str): CSS width for the whole table, in either px or %
+                - repeat_head_as_foot (bool): repeat the header row at the table foot (useful for long tables)
+                - row_striping (bool): False to override the default white-grey row stripes and make all white
 
-            header += '\n'
-
-        justifier = adjust_base_col
-        for idx in range(max_col):
-            justifier += adjust_extra_col
-
-        justifier += '\n'
-
-        rows = ''
-        for entry in table_data:
-            row = base_col
-            for idx, attrib, attr_format \
-                    in zipper(range(max_col), entry, formats, fillvalue=''):
-                if attr_format:
-                    value = attr_format.format(attrib)
-                else:
-                    value = attrib
-                row += extra_col.format(data=value)
-            rows += row + '\n'
-
-        table = header + justifier + rows
-        self.print_md('### {title}'.format(title=title))
-        self.print_md(table)
+        Examples:
+            ```python
+            data = [
+            ['row1', 'data', 'data', 80 ],
+            ['row2', 'data', 'data', 45 ],
+            ]
+            output.print_html_table(
+            table_data=data,
+            title="Example Table",
+            columns=["Row Name", "Column 1", "Column 2", "Percentage"],
+            formats=['', '', '', '{}%'],
+            last_line_style='color:red;',
+            column_head_align_styles=["left", "left", "center", "right"],
+            column_data_align_styles=["left", "left", "center", "right"],
+            column_widths=["100px", "100px", "500px", "100px"],
+            column_vertical_border_style="border:black solid 1px",
+            table_width_style='width:100%',
+            repeat_head_as_foot=True,
+            row_striping=False
+            )
+            ```
+        """
+        return self._runtime_output().print_html_table(
+            table_data,
+            columns,
+            formats,
+            title,
+            last_line_style,
+            kwargs.get("column_head_align_styles", None),
+            kwargs.get("column_data_align_styles", None),
+            kwargs.get("column_widths", None),
+            kwargs.get("column_vertical_border_style", None),
+            kwargs.get("table_width_style", None),
+            kwargs.get("repeat_head_as_foot", False),
+            kwargs.get("row_striping", True),
+        )
 
     def print_image(self, image_path):
         r"""Prints given image to the output.
@@ -627,15 +745,45 @@ class PyRevitOutputWindow(object):
             output.print_image(r'C:\image.gif')
             ```
         """
-        self.print_html(
-            "<span><img src=\"file:///{0}\"></span>".format(
-                image_path
-            )
+        return self._runtime_output().print_image(image_path)
+
+    @staticmethod
+    def buttonify(uibutton, title=None):
+        """Create an output-safe html button for a Revit ribbon button."""
+        label = (
+            title
+            or getattr(uibutton, "Text", None)
+            or getattr(uibutton, "AutomationName", None)
+            or getattr(uibutton, "Name", None)
+            or safe_strtype(uibutton)
+        )
+        control_id = (
+            getattr(uibutton, "Id", None)
+            or getattr(uibutton, "Name", None)
+            or EXEC_PARAMS.command_controlid
+        )
+        label = (
+            safe_strtype(label)
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+        quoted_control_id = urlquote(safe_strtype(control_id))
+
+        return coreutils.prepare_html_str(
+            '<a href="revit://outputhelpers?command=button&controlid={}" '
+            'style="display:inline-block;text-decoration:none;font:inherit;'
+            "padding:4px 10px;border:1px solid #8a8f94;"
+            'background:#f5f6f7;color:#233749;">{}</a>'.format(quoted_control_id, label)
         )
 
-    def insert_divider(self, level=''):
+    def print_button(self, uibutton, title=None):
+        """Print a Revit ribbon button as an embedded output button."""
+        self.print_html(coreutils.reverse_html(self.buttonify(uibutton, title)))
+
+    def insert_divider(self, level=""):
         """Add horizontal rule to the output window."""
-        self.print_md('%s\n-----' % level)
+        return self._runtime_output().insert_divider(level)
 
     def next_page(self):
         """Add hidden next page tag to the output window.
@@ -643,18 +791,25 @@ class PyRevitOutputWindow(object):
         This is helpful to silently separate the output to multiple pages
         for better printing.
         """
-        self.print_html('<div class="nextpage"></div><div>&nbsp</div>')
+        return self._runtime_output().next_page()
 
     @staticmethod
-    def linkify(element_ids, title=None):
+    def linkify(element_ids, title=None, output=None):
         """Create clickable link for the provided element ids.
 
-        This method, creates the link but does not print it directly.
+        This method, creates the link but does not print it directly. Any number
+        of ids is supported: lists too long to fit in a url are stored in the
+        output window and the link refers to them.
+
+        Note:
+            Called on an output wrapper, the link is bound to that wrapper's
+            window. Called on the class, it is bound to the running command's.
 
         Args:
             element_ids (ElementId | list[ElementId]): single or multiple ids
             title (str): tile of the link. defaults to list of element ids
-            
+            output (ScriptOutput): output window that resolves the link when
+                the ids are stored; defaults to the running command's output
 
         Returns:
             (str): clickable link
@@ -666,9 +821,14 @@ class PyRevitOutputWindow(object):
                 print('{}: {}'.format(idx+1, output.linkify(elid)))
             ```
         """
+
+        def register_ids(comma_separated_ids):
+            target = output or _command_runtime_output()
+            return target.register_element_ids(comma_separated_ids)
+
         return coreutils.prepare_html_str(
-            linkmaker.make_link(element_ids, contents=title)
-            )
+            linkmaker.make_link(element_ids, contents=title, register_ids=register_ids)
+        )
 
     def make_chart(self, version=None):
         """:obj:`PyRevitOutputChart`: Return chart object."""
@@ -677,70 +837,64 @@ class PyRevitOutputWindow(object):
     def make_line_chart(self, version=None):
         """:obj:`PyRevitOutputChart`: Return line chart object."""
         return charts.PyRevitOutputChart(
-            self,
-            chart_type=charts.LINE_CHART,
-            version=version
-            )
+            self, chart_type=charts.LINE_CHART, version=version
+        )
 
     def make_stacked_chart(self, version=None):
         """:obj:`PyRevitOutputChart`: Return stacked chart object."""
         chart = charts.PyRevitOutputChart(
-            self,
-            chart_type=charts.LINE_CHART,
-            version=version
-            )
-        chart.options.scales = {'yAxes': [{'stacked': True, }]}
+            self, chart_type=charts.LINE_CHART, version=version
+        )
+        chart.options.scales = {
+            "yAxes": [
+                {
+                    "stacked": True,
+                }
+            ]
+        }
         return chart
 
     def make_bar_chart(self, version=None):
         """:obj:`PyRevitOutputChart`: Return bar chart object."""
         return charts.PyRevitOutputChart(
-            self,
-            chart_type=charts.BAR_CHART,
-            version=version
-            )
+            self, chart_type=charts.BAR_CHART, version=version
+        )
 
     def make_radar_chart(self, version=None):
         """:obj:`PyRevitOutputChart`: Return radar chart object."""
         return charts.PyRevitOutputChart(
-            self,
-            chart_type=charts.RADAR_CHART,
-            version=version
-            )
+            self, chart_type=charts.RADAR_CHART, version=version
+        )
 
     def make_polar_chart(self, version=None):
         """:obj:`PyRevitOutputChart`: Return polar chart object."""
         return charts.PyRevitOutputChart(
-            self,
-            chart_type=charts.POLAR_CHART,
-            version=version
-            )
+            self, chart_type=charts.POLAR_CHART, version=version
+        )
 
     def make_pie_chart(self, version=None):
         """:obj:`PyRevitOutputChart`: Return pie chart object."""
         return charts.PyRevitOutputChart(
-            self,
-            chart_type=charts.PIE_CHART,
-            version=version
-            )
+            self, chart_type=charts.PIE_CHART, version=version
+        )
 
     def make_doughnut_chart(self, version=None):
-        """:obj:`PyRevitOutputChart`: Return dougnut chart object."""
+        """:obj:`PyRevitOutputChart`: Return doughnut chart object."""
         return charts.PyRevitOutputChart(
-            self,
-            chart_type=charts.DOUGHNUT_CHART,
-            version=version
-            )
+            self, chart_type=charts.DOUGHNUT_CHART, version=version
+        )
 
     def make_bubble_chart(self, version=None):
         """:obj:`PyRevitOutputChart`: Return bubble chart object."""
         return charts.PyRevitOutputChart(
-            self,
-            chart_type=charts.BUBBLE_CHART,
-            version=version
-            )
+            self, chart_type=charts.BUBBLE_CHART, version=version
+        )
 
 
 def get_output():
-    """:obj:`pyrevit.output.PyRevitOutputWindow` : Return output window."""
+    """:obj:`PyRevitOutputWindow`: Return a wrapper bound to current output.
+
+    Retain the returned wrapper when it will be used by a deferred or modeless
+    callback after the current command returns.
+    """
     return PyRevitOutputWindow()
